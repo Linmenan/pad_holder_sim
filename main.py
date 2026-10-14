@@ -230,6 +230,52 @@ def point_seg_dist(px, py, a, b):
     return math.hypot(px - proj[0], py - proj[1])
 
 
+def convex_polygons_sat(poly_a, poly_b):
+    """二维凸多边形 SAT 碰撞检测。
+
+    返回 (overlap, normal, depth):
+      overlap: bool
+      normal:  np.array([nx, ny]) 从 A 指向 B 的单位法线
+      depth:   float 最小穿透深度 (沿 normal 分离所需距离)
+    """
+    if len(poly_a) < 3 or len(poly_b) < 3:
+        return False, None, 0.0
+    best_depth = float('inf')
+    best_axis = None
+
+    for poly in (poly_a, poly_b):
+        n = len(poly)
+        for i in range(n):
+            p1 = poly[i]; p2 = poly[(i + 1) % n]
+            ex = float(p2[0] - p1[0]); ey = float(p2[1] - p1[1])
+            ax = -ey; ay = ex
+            nrm = math.hypot(ax, ay)
+            if nrm < 1e-9:
+                continue
+            ax /= nrm; ay /= nrm
+            proj_a = [ax * float(q[0]) + ay * float(q[1]) for q in poly_a]
+            proj_b = [ax * float(q[0]) + ay * float(q[1]) for q in poly_b]
+            min_a, max_a = min(proj_a), max(proj_a)
+            min_b, max_b = min(proj_b), max(proj_b)
+            if max_a < min_b or max_b < min_a:
+                return False, None, 0.0
+            overlap1 = max_a - min_b
+            overlap2 = max_b - min_a
+            if overlap1 < overlap2:
+                overlap = overlap1
+                dirx, diry = ax, ay
+            else:
+                overlap = overlap2
+                dirx, diry = -ax, -ay
+            if overlap < best_depth:
+                best_depth = overlap
+                best_axis = np.array([dirx, diry])
+
+    if best_axis is None:
+        return False, None, 0.0
+    return True, best_axis, best_depth
+
+
 # ============================================================
 #   数据模型
 # ============================================================
@@ -245,6 +291,7 @@ class ConnPoint:
         self.mass = 0.0
         self.link = None
         self.broken = False
+        self.static_damping = 0.0   # 静态阻尼力矩 (N·m, 仅 revolute 使用)
 
     def world(self, pos=None, ang=None):
         if pos is None: pos = self.part.pos
@@ -344,6 +391,7 @@ class Link:
         self.strength  = 3000.0
         self.broken    = False
         self.limit_active = False       # 弹簧限位是否已触发 (用于日志状态切换)
+        self.static_damping = 0.0       # 静态阻尼力矩 (N·m, 仅 revolute 使用)
 
 
 # ============================================================
@@ -736,6 +784,7 @@ class App:
 
         self.parts = []
         self.links = []
+        self.collisions = []           # [(partA, partB), ...] 碰撞约束对
         self.stage = 'design'
         self.mode  = 'select'
         self.data_revision = 0
@@ -923,8 +972,10 @@ class App:
             self.set_mode(self.mode)
 
         elif self.stage == 'assemble':
-            mkbtn(self.toolbar, '装配 (Ctrl多选)', self.do_assemble, w=16,
+            mkbtn(self.toolbar, '装配连接附', self.do_assemble, w=12,
                   col='#e69500', fg='white')
+            mkbtn(self.toolbar, '碰撞装配', self.do_collision_assemble, w=10,
+                  col='#455a64', fg='white')
             mkbtn(self.toolbar, '清空多选', self.clear_assemble_sel, w=10)
             mkbtn(self.toolbar, '全选未连接', self.select_all_unconnected, w=12)
             mkbtn(self.toolbar, '适应视图', self.fit_view, w=10)
@@ -1157,7 +1208,7 @@ class App:
 
     # ---------------- 清空 / 示例 ----------------
     def clear_all(self):
-        self.parts.clear(); self.links.clear()
+        self.parts.clear(); self.links.clear(); self.collisions.clear()
         ConnPoint._pid = 0; Part._ptid = 0; Link._lid = 0
         self.sel = None
         self.assemble_sel.clear()
@@ -1169,7 +1220,7 @@ class App:
         self.redraw()
 
     def build_demo(self):
-        self.parts.clear(); self.links.clear()
+        self.parts.clear(); self.links.clear(); self.collisions.clear()
         ConnPoint._pid = 0; Part._ptid = 0; Link._lid = 0
         self.sel = None
         self.assemble_sel.clear()
@@ -1245,7 +1296,10 @@ class App:
             pA.local = pA.part.w2l(mid)
             pB.local = pB.part.w2l(mid)
         lk = Link(pA, pB, type_)
-        if type_ == 'spring':
+        if type_ == 'revolute':
+            lk.static_damping = (getattr(pA, 'static_damping', 0.0)
+                                 + getattr(pB, 'static_damping', 0.0)) * 0.5
+        elif type_ == 'spring':
             L = natural_length if natural_length else \
                 float(np.linalg.norm(pA.world() - pB.world()))
             lk.l0    = max(L, 30.0)
@@ -1534,7 +1588,13 @@ class App:
                 else: self.assemble_sel.append(obj)
                 self.update_props()
             else:
-                self.sel = ('point', obj)
+                # 已连接的连接附 -> 进入 Link 属性面板
+                # (转动副/弹簧/磁吸都可以在此编辑其 Link 参数)
+                lk = self._find_link_of(obj) if obj.link is not None else None
+                if lk is not None:
+                    self.sel = ('link', lk)
+                else:
+                    self.sel = ('point', obj)
                 self.assemble_sel.clear()
                 self.update_props()
         elif kind == 'link':
@@ -1542,12 +1602,20 @@ class App:
             self.assemble_sel.clear()
             self.update_props()
         elif kind == 'part':
-            self.sel = ('part', obj)
-            if not obj.locked:
-                self.dragging = ('part', obj)
-                self.drag_grab_local = obj.w2l(self.mouse_world)
-            if not ctrl: self.assemble_sel.clear()
-            self.update_props()
+            if ctrl:
+                if obj in self.assemble_sel:
+                    self.assemble_sel.remove(obj)
+                else:
+                    self.assemble_sel.append(obj)
+                self.sel = ('part', obj)
+                self.update_props()
+            else:
+                self.sel = ('part', obj)
+                if not obj.locked:
+                    self.dragging = ('part', obj)
+                    self.drag_grab_local = obj.w2l(self.mouse_world)
+                self.assemble_sel.clear()
+                self.update_props()
         else:
             if not ctrl:
                 self.assemble_sel.clear()
@@ -1737,6 +1805,18 @@ class App:
         if lk in self.links:
             self.links.remove(lk)
 
+    def _find_link_of(self, cp):
+        """根据连接附找到它所属的 Link 对象。
+
+        注意: ConnPoint.link 存的是"配对的另一端 ConnPoint",
+        而不是 Link 对象本身。要取得 Link 必须遍历 self.links。
+        """
+        if cp is None: return None
+        for lk in self.links:
+            if lk.pA is cp or lk.pB is cp:
+                return lk
+        return None
+
     def _auto_break_revolutes_if_separated(self, tol=2.0):
         """设计阶段拖动后调用: 若已建立的转动副两端连接附世界坐标
         不再重合, 则自动断开这对连接。
@@ -1770,11 +1850,11 @@ class App:
     # ---------------- 装配动作 ----------------
     def do_assemble(self):
         if self.stage != 'assemble': return
-        sel = list(self.assemble_sel)
-        if len(sel) != 2:
+        cps = [x for x in self.assemble_sel if isinstance(x, ConnPoint)]
+        if len(cps) != 2:
             messagebox.showinfo('提示', '请按住 Ctrl 选中恰好 2 个连接附')
             return
-        cpA, cpB = sel[0], sel[1]
+        cpA, cpB = cps[0], cps[1]
         ok, msg = self._validate_assembly_static(cpA, cpB)
         if not ok:
             messagebox.showinfo('无法装配', msg)
@@ -1829,6 +1909,29 @@ class App:
             self.set_status(f'装配成功: 弹簧 #{lk.id}')
         else:
             self.set_status(f'装配成功: {type_} 连接 #{lk.id}')
+        self.update_props()
+        self.redraw()
+
+    def do_collision_assemble(self):
+        """碰撞装配: Ctrl 选中两个零件后创建碰撞约束"""
+        if self.stage != 'assemble': return
+        parts = [x for x in self.assemble_sel if isinstance(x, Part)]
+        if len(parts) != 2:
+            messagebox.showinfo('提示', '请按住 Ctrl 选中恰好 2 个零件')
+            return
+        pA, pB = parts[0], parts[1]
+        if pA is pB:
+            messagebox.showinfo('提示', '两个零件相同'); return
+        for (qa, qb) in self.collisions:
+            if (qa is pA and qb is pB) or (qa is pB and qb is pA):
+                messagebox.showinfo('提示', '碰撞约束已存在')
+                return
+        self.collisions.append((pA, pB))
+        logger.info(f'[collision] 创建碰撞约束 零件#{pA.id}"{pA.name}"'
+                    f' ↔ 零件#{pB.id}"{pB.name}"')
+        self.assemble_sel.clear()
+        self.set_status(f'碰撞装配: 零件#{pA.id} ↔ 零件#{pB.id}')
+        self._touch()
         self.update_props()
         self.redraw()
 
@@ -1895,6 +1998,8 @@ class App:
         for lk in self.links:
             if lk.type == 'spring': self._apply_spring(lk)
             elif lk.type == 'magnet': self._apply_magnet(lk)
+            elif lk.type == 'revolute':
+                self._apply_revolute_static_damping(lk)
         for p in self.parts:
             if p.locked: continue
             m = p.all_mass(); I = p.inertia()
@@ -1918,6 +2023,9 @@ class App:
             for lk in self.links:
                 if lk.type == 'spring':
                     self._solve_spring_limit_position(lk)
+            # 碰撞位置约束 (硬约束, 沿最小穿透法线分离)
+            for (pA, pB) in self.collisions:
+                self._solve_collision_position(pA, pB)
 
         for p in self.parts:
             if p.locked: continue
@@ -1942,6 +2050,10 @@ class App:
                         logger.info(
                             f'[LIMIT-OFF] link#{lk.id} '
                             f'L={L_now:.4f} lmax={lk.lmax:.4f} (released)')
+
+        # 碰撞速度约束 (非弹性, 法向相对速度归零, 吸收动能)
+        for (pA, pB) in self.collisions:
+            self._solve_collision_velocity(pA, pB)
 
     def _spring_force_components(self, lk):
         """分解弹簧的力 (都返回作用在 pA 上的力向量)
@@ -2117,6 +2229,62 @@ class App:
             pb.pred_pos   = pb.pred_pos   - invMB * lam
             pb.pred_angle = pb.pred_angle - invIB * (pB_ @ lam)
 
+    def _apply_revolute_static_damping(self, lk):
+        """转动副的静态阻尼力矩 (夹紧效果)。
+
+        模拟铰链处的夹紧装置: 抵抗两端的相对转动, 力矩方向与相对角
+        速度相反。用 tanh 平滑以避免零点抖动, 数值越大夹紧越强。
+        仅在 Link.static_damping > 0 时生效。
+        """
+        if lk.type != 'revolute': return
+        if lk.static_damping <= 1e-9: return
+        pa, pb = lk.pA.part, lk.pB.part
+        if pa.locked and pb.locked: return
+        omega_rel = pa.omega - pb.omega
+        torque = lk.static_damping * math.tanh(omega_rel * 8.0)
+        if not pa.locked:
+            pa.tq -= torque
+        if not pb.locked:
+            pb.tq += torque
+
+    def _solve_collision_position(self, pA, pB):
+        """碰撞位置约束: 沿最小穿透法线分离两零件的凸包"""
+        if pA.locked and pB.locked: return
+        if len(pA.hull) < 3 or len(pB.hull) < 3: return
+        polyA = [pA.pred_pos + rot(pA.pred_angle) @ v for v in pA.hull]
+        polyB = [pB.pred_pos + rot(pB.pred_angle) @ v for v in pB.hull]
+        overlap, normal, depth = convex_polygons_sat(polyA, polyB)
+        if not overlap or depth < 1e-6: return
+        invMA = 0.0 if pA.locked else 1.0 / pA.all_mass()
+        invMB = 0.0 if pB.locked else 1.0 / pB.all_mass()
+        tot = invMA + invMB
+        if tot < 1e-12: return
+        if not pA.locked:
+            pA.pred_pos = pA.pred_pos - normal * depth * (invMA / tot)
+        if not pB.locked:
+            pB.pred_pos = pB.pred_pos + normal * depth * (invMB / tot)
+
+    def _solve_collision_velocity(self, pA, pB):
+        """碰撞速度约束 (完全非弹性): 法向相对速度归零, 吸收动能"""
+        if pA.locked and pB.locked: return
+        if len(pA.hull) < 3 or len(pB.hull) < 3: return
+        polyA = [pA.pred_pos + rot(pA.pred_angle) @ v for v in pA.hull]
+        polyB = [pB.pred_pos + rot(pB.pred_angle) @ v for v in pB.hull]
+        overlap, normal, depth = convex_polygons_sat(polyA, polyB)
+        if not overlap or depth < 1e-6: return
+        vA = pA.v; vB = pB.v
+        v_rel_n = float((vB - vA) @ normal)
+        if v_rel_n >= 0: return                  # 正在分离, 不干预
+        invMA = 0.0 if pA.locked else 1.0 / pA.all_mass()
+        invMB = 0.0 if pB.locked else 1.0 / pB.all_mass()
+        tot = invMA + invMB
+        if tot < 1e-12: return
+        lam = -v_rel_n / tot
+        if not pA.locked:
+            pA.v = pA.v - invMA * lam * normal
+        if not pB.locked:
+            pB.v = pB.v + invMB * lam * normal
+
     def _solve_spring_limit_position(self, lk):
         """弹簧限位位置约束 (硬约束, 恢复系数 = 0)
 
@@ -2277,6 +2445,15 @@ class App:
         self._draw_grid(W, H)
         for p in self.parts:
             self._draw_part(p)
+        # 碰撞约束可视化
+        for (pA, pB) in self.collisions:
+            xa, ya = self.w2s(pA.l2w(pA.com_local()))
+            xb, yb = self.w2s(pB.l2w(pB.com_local()))
+            self.canvas.create_line(xa, ya, xb, yb,
+                                    fill='#d84315', width=2, dash=(3, 5))
+            self.canvas.create_text((xa + xb) / 2, (ya + yb) / 2 - 10,
+                                    text='碰撞', fill='#d84315',
+                                    font=('Microsoft YaHei', 8, 'bold'))
         for lk in self.links:
             if lk.type == 'spring': self._draw_spring(lk)
             elif lk.type == 'magnet': self._draw_magnet(lk)
@@ -2504,12 +2681,32 @@ class App:
             fill_col = '#cfd8dc'; outline_col = '#455a64'
         else:
             fill_col = '#e3f2fd'; outline_col = '#1e88e5'
+
+        # 装配阶段的多选高亮 (Part 在 assemble_sel 中)
+        in_sel = (self.stage == 'assemble' and part in self.assemble_sel)
+        if in_sel:
+            outline_col = '#e69500'
+            if not part.locked:
+                fill_col = '#ffe0b2'
+
         if self.sel and self.sel[0] == 'part' and self.sel[1] is part:
             outline_col = '#ff6f00'
+
         c.create_polygon(*pts, fill=fill_col, outline=outline_col, width=2)
+
+        cx = sum(pts[0::2]) / (len(pts) // 2)
+        cy = sum(pts[1::2]) / (len(pts) // 2)
+
+        # 多选序号角标
+        if in_sel:
+            idx = self.assemble_sel.index(part) + 1
+            c.create_oval(cx - 13, cy - 32, cx + 13, cy - 10,
+                          fill='#e69500', outline='#7f4f00')
+            c.create_text(cx, cy - 21, text=str(idx),
+                          fill='white',
+                          font=('Arial', 11, 'bold'))
+
         if part.locked:
-            cx = sum(pts[0::2]) / (len(pts) // 2)
-            cy = sum(pts[1::2]) / (len(pts) // 2)
             c.create_text(cx, cy, text='锁定', fill='#263238',
                           font=('Microsoft YaHei', 8, 'bold'))
 
@@ -2677,14 +2874,19 @@ class App:
         if self.stage == 'simulate':
             self._props_sim_status(p)
         if self.stage == 'assemble':
-            tk.Label(p, text=f'已选中连接附: {len(self.assemble_sel)} 个',
+            tk.Label(p, text=f'已选中: {len(self.assemble_sel)} 个',
                      bg='#3c3f41', fg='#e69500',
                      font=('Microsoft YaHei', 9, 'bold')
                      ).pack(anchor='w', pady=2)
-            for i, cp in enumerate(self.assemble_sel):
-                tk.Label(p, text=f'  {i+1}. #{cp.id} [{cp.type}] @ {cp.part.name}',
-                         bg='#3c3f41', fg='#cccccc', anchor='w',
-                         font=('Consolas', 9)).pack(anchor='w')
+            for i, item in enumerate(self.assemble_sel):
+                if isinstance(item, Part):
+                    lbl = f'  {i+1}. 零件 #{item.id} "{item.name}"'
+                else:
+                    lbl = (f'  {i+1}. 连接附 #{item.id} [{item.type}]'
+                           f' @ {item.part.name}')
+                tk.Label(p, text=lbl, bg='#3c3f41', fg='#cccccc',
+                         anchor='w', font=('Consolas', 9)
+                         ).pack(anchor='w')
             tk.Frame(p, height=1, bg='#555555').pack(fill='x', pady=8)
         obj = self.sel
         if obj is None:
@@ -2772,7 +2974,17 @@ class App:
         for cp in o.points:
             tag = ' [已连接]' if cp.link else ''
             def _sel(c=cp):
-                self.sel = ('point', c); self.update_props(); self.redraw()
+                # 装配阶段点已连接的连接附 -> 进入其 Link 属性面板
+                if self.stage == 'assemble' and c.link is not None:
+                    lk = self._find_link_of(c)
+                    if lk is not None:
+                        self.sel = ('link', lk)
+                    else:
+                        self.sel = ('point', c)
+                else:
+                    self.sel = ('point', c)
+                self.update_props()
+                self.redraw()
             tk.Button(p, text=f'  #{cp.id}  [{cp.type}]{tag}',
                       relief='flat', bg='#3c3f41', fg='#dddddd',
                       anchor='w', command=_sel).pack(fill='x', pady=1)
@@ -2986,10 +3198,17 @@ class App:
         tk.Label(p, text=f'局部坐标: ({cp.local[0]:.1f}, {cp.local[1]:.1f})',
                  bg='#3c3f41', fg='#999999').pack(anchor='w', pady=4)
         if cp.link:
-            tk.Label(p, text=f'已连接 #{cp.link.id} ({cp.link.type})',
-                     bg='#3c3f41', fg='#8bc34a',
-                     font=('Microsoft YaHei', 9, 'bold')
-                     ).pack(anchor='w', pady=2)
+            lk = self._find_link_of(cp)
+            if lk is not None:
+                tk.Label(p, text=f'已连接 连接 #{lk.id} ({lk.type})',
+                         bg='#3c3f41', fg='#8bc34a',
+                         font=('Microsoft YaHei', 9, 'bold')
+                         ).pack(anchor='w', pady=2)
+            else:
+                tk.Label(p, text='已配对 (未找到连接对象)',
+                         bg='#3c3f41', fg='#ef5350',
+                         font=('Microsoft YaHei', 9, 'bold')
+                         ).pack(anchor='w', pady=2)
             if self.stage == 'design':
                 tk.Button(p, text='断开连接', relief='flat', bg='#7f2d2d',
                           fg='white',
@@ -3005,6 +3224,18 @@ class App:
                       ).pack(fill='x', pady=3)
 
     def _props_link(self, p, lk):
+        # 类型安全: 如果误传入 ConnPoint (没有 pA/pB), 回退到连接附面板
+        if not hasattr(lk, 'pA') or not hasattr(lk, 'pB'):
+            # lk 是 ConnPoint, 尝试找到它所属的 Link
+            real_lk = self._find_link_of(lk)
+            if real_lk is not None:
+                lk = real_lk
+            else:
+                self._props_point(p, lk)
+                return
+        if lk.type == 'revolute':
+            self._props_revolute_link(p, lk)
+            return
         type_name = {'spring': '弹簧', 'magnet': '磁吸连接'}.get(lk.type, lk.type)
         color = {'spring': '#2e7d32', 'magnet': '#7e57c2'}.get(lk.type, '#4a90d9')
         tk.Label(p, text=f'◆ {type_name} #{lk.id}',
@@ -3064,6 +3295,57 @@ class App:
                                    self.clear_selection())
                   ).pack(fill='x', pady=6)
 
+    def _props_revolute_link(self, p, lk):
+        """转动副属性面板 (装配界面)"""
+        tk.Label(p, text=f'◆ 转动副 #{lk.id}',
+                 bg='#3c3f41', fg='#4a90d9',
+                 font=('Microsoft YaHei', 10, 'bold')
+                 ).pack(anchor='w', pady=(4, 6))
+        tk.Label(p, text=f'{lk.pA.part.name} ↔ {lk.pB.part.name}',
+                 bg='#3c3f41', fg='#999999',
+                 font=('Microsoft YaHei', 9)).pack(anchor='w', pady=2)
+        wa = lk.pA.world(); wb = lk.pB.world()
+        dev = float(np.linalg.norm(wa - wb))
+        tk.Label(p, text=f'两端偏差: {dev:.3f} px',
+                 bg='#3c3f41', fg='#999999',
+                 font=('Consolas', 9)).pack(anchor='w', pady=2)
+        tk.Frame(p, height=1, bg='#555555').pack(fill='x', pady=6)
+
+        tk.Label(p, text='静态阻尼力矩 (N·m)',
+                 bg='#3c3f41', fg='#cccccc',
+                 font=('Microsoft YaHei', 9)).pack(anchor='w')
+        var = tk.StringVar(value=f'{lk.static_damping:.4f}')
+        entry = tk.Entry(p, textvariable=var, bg='#2b2b2b', fg='#eeeeee',
+                         insertbackground='white', relief='flat')
+        entry.pack(fill='x', pady=2)
+        tk.Label(p, text='模拟铰链处的夹紧装置: 抵抗相对转动,\n'
+                         '数值越大夹紧越强 (0 = 无夹紧)',
+                 bg='#3c3f41', fg='#888888', justify='left',
+                 font=('Microsoft YaHei', 8)).pack(anchor='w', pady=(2, 6))
+
+        def on_confirm():
+            try:
+                v = float(var.get())
+            except ValueError:
+                messagebox.showerror('输入错误', '请输入有效的数值')
+                return
+            if v < 0:
+                messagebox.showerror('输入错误', '不能为负值')
+                return
+            lk.static_damping = v
+            self._touch()
+            self.set_status(f'转动副 #{lk.id} 静态阻尼力矩 = {v:.4f} N·m')
+            logger.info(f'[revolute] link#{lk.id} static_damping = {v:.4f}')
+
+        tk.Button(p, text='确定', relief='flat', bg='#2e7d32', fg='white',
+                  command=on_confirm).pack(fill='x', pady=3)
+        tk.Button(p, text='断开该转动副', relief='flat', bg='#7f2d2d',
+                  fg='white',
+                  command=lambda: (self._unlink_by_link(lk),
+                                   self._touch(),
+                                   self.clear_selection())
+                  ).pack(fill='x', pady=3)
+
     def _set_name(self, o, v):
         o.name = v
         self._touch()
@@ -3109,6 +3391,7 @@ class App:
             'version': 1,
             'parts': [],
             'links': [],
+            'collisions': [],
         }
         for p in self.parts:
             pd = {
@@ -3128,6 +3411,7 @@ class App:
                     'type': cp.type,
                     'damping': float(cp.damping),
                     'mass': float(cp.mass),
+                    'static_damping': float(getattr(cp, 'static_damping', 0.0)),
                 })
             data['parts'].append(pd)
         for lk in self.links:
@@ -3145,7 +3429,10 @@ class App:
                 'mk': float(lk.mk),
                 'strength': float(lk.strength),
                 'broken': bool(lk.broken),
+                'static_damping': float(getattr(lk, 'static_damping', 0.0)),
             })
+        for (pA, pB) in self.collisions:
+            data['collisions'].append([pA.id, pB.id])
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -3165,7 +3452,7 @@ class App:
             messagebox.showerror('加载失败', str(ex))
             return
 
-        self.parts.clear(); self.links.clear()
+        self.parts.clear(); self.links.clear(); self.collisions.clear()
         self.sel = None
         self.assemble_sel.clear()
         self.dragging = None
@@ -3187,6 +3474,7 @@ class App:
                 cp.id = cpd['id']
                 cp.damping = float(cpd.get('damping', 2.0))
                 cp.mass = float(cpd.get('mass', 0.0))
+                cp.static_damping = float(cpd.get('static_damping', 0.0))
                 p.points.append(cp)
                 id_to_cp[(pd['id'], cpd['id'])] = cp
             self.parts.append(p)
@@ -3210,8 +3498,20 @@ class App:
             lk.mk    = float(ld.get('mk', 500.0))
             lk.strength = float(ld.get('strength', 3000.0))
             lk.broken   = bool(ld.get('broken', False))
+            lk.static_damping = float(ld.get('static_damping', 0.0))
             self.links.append(lk)
         Link._lid = max([l.id for l in self.links] + [0])
+
+        # 恢复碰撞对
+        for item in data.get('collisions', []):
+            try:
+                a_id, b_id = int(item[0]), int(item[1])
+            except Exception:
+                continue
+            pA = id_to_part.get(a_id)
+            pB = id_to_part.get(b_id)
+            if pA is not None and pB is not None and pA is not pB:
+                self.collisions.append((pA, pB))
 
         self._touch()
         self.fit_view()

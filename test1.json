@@ -66,7 +66,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 2,
@@ -76,7 +77,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 3,
@@ -86,7 +88,8 @@
           ],
           "type": "spring",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         }
       ]
     },
@@ -138,10 +141,10 @@
       "locked": false,
       "body_mass": 0.15,
       "pos": [
-        549.7648839206557,
-        27.61561230548405
+        549.7632904511585,
+        27.615014442624705
       ],
-      "angle": -0.18078082773577897,
+      "angle": -0.180783429808511,
       "points": [
         {
           "id": 4,
@@ -151,7 +154,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 5,
@@ -161,7 +165,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         }
       ]
     },
@@ -217,10 +222,10 @@
       "locked": false,
       "body_mass": 0.2,
       "pos": [
-        1955.225196730707,
-        -30.599597374198886
+        1955.2243975974982,
+        -30.59989180180717
       ],
-      "angle": 0.3509122187195075,
+      "angle": 0.35120715418239556,
       "points": [
         {
           "id": 7,
@@ -230,7 +235,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 8,
@@ -240,7 +246,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 9,
@@ -250,7 +257,8 @@
           ],
           "type": "payload",
           "damping": 2.0,
-          "mass": 0.468
+          "mass": 0.468,
+          "static_damping": 0.0
         }
       ]
     },
@@ -306,10 +314,10 @@
       "locked": false,
       "body_mass": 0.15,
       "pos": [
-        706.0189714616455,
-        142.7420424173251
+        706.0118039856895,
+        142.74790501551755
       ],
-      "angle": -0.14923588657735712,
+      "angle": -0.14924278750185452,
       "points": [
         {
           "id": 10,
@@ -319,7 +327,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 11,
@@ -329,7 +338,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 16,
@@ -339,7 +349,8 @@
           ],
           "type": "spring",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         }
       ]
     },
@@ -395,10 +406,10 @@
       "locked": false,
       "body_mass": 0.2,
       "pos": [
-        928.2625319625097,
-        -556.0272254199491
+        928.2579293747834,
+        -556.0158706266203
       ],
-      "angle": 0.47885311641771083,
+      "angle": 0.47897171759488566,
       "points": [
         {
           "id": 12,
@@ -408,7 +419,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 13,
@@ -418,7 +430,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 14,
@@ -428,7 +441,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 15,
@@ -438,7 +452,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 21,
@@ -448,7 +463,8 @@
           ],
           "type": "spring",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         }
       ]
     },
@@ -504,10 +520,10 @@
       "locked": false,
       "body_mass": 0.2,
       "pos": [
-        1414.2774190553002,
-        -265.6819979275415
+        1414.2725274575776,
+        -265.6865093667699
       ],
-      "angle": -0.0386196415237985,
+      "angle": -0.03866116802456059,
       "points": [
         {
           "id": 17,
@@ -517,7 +533,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 18,
@@ -527,7 +544,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 22,
@@ -537,7 +555,8 @@
           ],
           "type": "spring",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         }
       ]
     },
@@ -589,10 +608,10 @@
       "locked": false,
       "body_mass": 0.2,
       "pos": [
-        1521.1482963597475,
-        -334.57052406971997
+        1521.1575276963165,
+        -334.5511734643907
       ],
-      "angle": -0.05272337452859875,
+      "angle": -0.052756061019467095,
       "points": [
         {
           "id": 19,
@@ -602,7 +621,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         },
         {
           "id": 20,
@@ -612,7 +632,8 @@
           ],
           "type": "revolute",
           "damping": 2.0,
-          "mass": 0.0
+          "mass": 0.0,
+          "static_damping": 0.0
         }
       ]
     }
@@ -631,7 +652,8 @@
       "c": 0.0,
       "mk": 500.0,
       "strength": 3000.0,
-      "broken": false
+      "broken": false,
+      "static_damping": 0.0
     },
     {
       "id": 8,
@@ -646,7 +668,8 @@
       "c": 5.0,
       "mk": 500.0,
       "strength": 3000.0,
-      "broken": false
+      "broken": false,
+      "static_damping": 1.0
     },
     {
       "id": 9,
@@ -661,7 +684,8 @@
       "c": 5.0,
       "mk": 500.0,
       "strength": 3000.0,
-      "broken": false
+      "broken": false,
+      "static_damping": 0.0
     },
     {
       "id": 14,
@@ -676,7 +700,8 @@
       "c": 0.0,
       "mk": 500.0,
       "strength": 3000.0,
-      "broken": false
+      "broken": false,
+      "static_damping": 0.0
     },
     {
       "id": 19,
@@ -691,7 +716,8 @@
       "c": 5.0,
       "mk": 500.0,
       "strength": 3000.0,
-      "broken": false
+      "broken": false,
+      "static_damping": 0.0
     },
     {
       "id": 20,
@@ -706,7 +732,8 @@
       "c": 5.0,
       "mk": 500.0,
       "strength": 3000.0,
-      "broken": false
+      "broken": false,
+      "static_damping": 0.0
     },
     {
       "id": 21,
@@ -721,7 +748,8 @@
       "c": 5.0,
       "mk": 500.0,
       "strength": 3000.0,
-      "broken": false
+      "broken": false,
+      "static_damping": 0.5
     },
     {
       "id": 22,
@@ -736,7 +764,8 @@
       "c": 5.0,
       "mk": 500.0,
       "strength": 3000.0,
-      "broken": false
+      "broken": false,
+      "static_damping": 0.5
     },
     {
       "id": 23,
@@ -751,7 +780,8 @@
       "c": 5.0,
       "mk": 500.0,
       "strength": 3000.0,
-      "broken": false
+      "broken": false,
+      "static_damping": 0.0
     },
     {
       "id": 24,
@@ -766,7 +796,18 @@
       "c": 5.0,
       "mk": 500.0,
       "strength": 3000.0,
-      "broken": false
+      "broken": false,
+      "static_damping": 1.0
     }
+  ],
+  "collisions": [
+    [
+      2,
+      4
+    ],
+    [
+      6,
+      7
+    ]
   ]
 }
