@@ -65,6 +65,7 @@ FORCE_VIZ = {
     'total_m':    {'color': '#ad1457', 'label': '合力矩',   'width': 3},
     'gravity':    {'color': '#000000', 'label': '重力',     'width': 3},
     'revolute':   {'color': '#1565c0', 'label': '刚性接触', 'width': 3},
+    'revolute_m': {'color': '#0d47a1', 'label': '铰链力矩', 'width': 3},
     'spring':     {'color': '#2e7d32', 'label': '弹簧刚度', 'width': 3},
     'spring_lim': {'color': '#880e4f', 'label': '限位(含阻尼)', 'width': 3},
     'damping':    {'color': '#ff8c00', 'label': '阻尼力',   'width': 3},
@@ -114,6 +115,8 @@ FEASIBILITY_TOL  = 0.5
 LIMIT_STIFFNESS_MULT = 39.0    # 限位额外刚度倍数 (总刚度 = k * (1+39) = 40k)
 LIMIT_STOP_ITER      = 2       # 限位速度截停的 Gauss-Seidel 迭代次数
                                # (一次足够使 v_rel=0; 两次防止多弹簧同时触发时耦合)
+FRICTION_ITER        = 2       # 转动副静摩擦的 Gauss-Seidel 迭代次数
+                               # (单铰链一次即精确; 多铰链耦合时迭代收敛)
 
 SIM_FIXED_DT        = 1.0 / 60.0
 SIM_STEPS_PER_BATCH = 8
@@ -391,7 +394,12 @@ class Link:
         self.strength  = 3000.0
         self.broken    = False
         self.limit_active = False       # 弹簧限位是否已触发 (用于日志状态切换)
-        self.static_damping = 0.0       # 静态阻尼力矩 (N·m, 仅 revolute 使用)
+        self.static_damping = 0.0       # 静态摩擦极限力矩 (N·m, 仅 revolute)
+        self.moment = 0.0               # 铰链"实际提供"的力矩 (kg·px²/s²)
+                                        # 静摩擦时=维持平衡所需力矩
+                                        # 滑动摩擦时=被钳制到 ±M_max
+        self.moment_raw = 0.0           # 静力平衡解 (未钳制的"所需力矩")
+        self.friction_saturated = False # 本轮是否已进入滑动摩擦
 
 
 # ============================================================
@@ -488,17 +496,24 @@ class Simulator:
 
             for cp in p.points:
                 at_world = cp.world()
-                components = []
+                components = []           # [(kind, F_vec, at), ...]
+                moments    = []           # [(kind, M_scalar, at), ...]
 
-                # ---- 1) 刚性接触反力 (revolute) ----
+                # ---- 1) 刚性接触反力 + 铰链力矩 (revolute) ----
                 for lk in self.app.links:
                     if lk.type != 'revolute': continue
                     if lk.pA is cp:
                         components.append(('revolute',
                                            -lk.force.copy(), at_world))
+                        if abs(lk.moment) > 1e-6:
+                            moments.append(('revolute_m',
+                                            -lk.moment, at_world))
                     elif lk.pB is cp:
                         components.append(('revolute',
                                             lk.force.copy(), at_world))
+                        if abs(lk.moment) > 1e-6:
+                            moments.append(('revolute_m',
+                                            lk.moment, at_world))
 
                 # ---- 2) 弹簧: 分解为刚度力 / 限位力 / 阻尼力 ----
                 # 说明: 限位力同时包含限位刚度与限位单向阻尼
@@ -538,20 +553,25 @@ class Simulator:
                     cp_total_f = cp_total_f + F
 
                 # 只把"静态分量"累加进零件整体平衡
-                # (排除阻尼力: 阻尼是动态分量, 稳态时仍有微小值,
-                #  且铰链反力求解方程里本就不含阻尼力)
                 cp_static_f = np.zeros(2)
+                cp_total_m = 0.0
                 for kind, F, at in components:
                     if kind == 'damping':
                         continue
                     cp_static_f = cp_static_f + F
                     r = at - com_world
-                    total_moment += r[0]*F[1] - r[1]*F[0]
+                    cp_total_m += r[0]*F[1] - r[1]*F[0]
+                # 铰链力矩: 直接加总 (关于质心的力矩也是 M 本身)
+                for kind, M, at in moments:
+                    cp_total_m += M
                 total_force = total_force + cp_static_f
+                total_moment += cp_total_m
 
                 cp_forces[cp.id] = {
                     'components': components,
+                    'moments':    moments,
                     'total_f': cp_total_f,
+                    'total_m': cp_total_m,
                     'at': at_world,
                 }
 
@@ -1998,8 +2018,9 @@ class App:
         for lk in self.links:
             if lk.type == 'spring': self._apply_spring(lk)
             elif lk.type == 'magnet': self._apply_magnet(lk)
-            elif lk.type == 'revolute':
-                self._apply_revolute_static_damping(lk)
+            # 注意: 转动副静摩擦不在力累加阶段调用。
+            # 它是角冲量, 直接修改 omega, 必须在速度回写之后调用
+            # (见本方法末尾的 _apply_revolute_static_damping(lk, h))。
         for p in self.parts:
             if p.locked: continue
             m = p.all_mass(); I = p.inertia()
@@ -2033,6 +2054,17 @@ class App:
             p.omega = (p.pred_angle - p.angle) / h
             p.pos = p.pred_pos.copy()
             p.angle = p.pred_angle
+
+        # 转动副静摩擦 (角冲量式, 直接作用于 ω)
+        # 迭代 FRICTION_ITER 次以处理多铰链耦合:
+        #   - 单铰链时一次即精确归零 ω_rel
+        #   - 当多个铰链共享同一零件时, 后一个铰链的冲量会改变前一个
+        #     铰链的相对角速度, 通过 Gauss-Seidel 迭代逐步收敛,
+        #     保证每个铰链的残余 ω_rel 都趋于零 → 静摩擦保持
+        for _fric_it in range(FRICTION_ITER):
+            for lk in self.links:
+                if lk.type == 'revolute':
+                    self._apply_revolute_static_damping(lk, h)
 
         # 弹簧限位速度级截停 (二次校正, 清除残余 v_rel)
         for lk in self.links:
@@ -2229,23 +2261,50 @@ class App:
             pb.pred_pos   = pb.pred_pos   - invMB * lam
             pb.pred_angle = pb.pred_angle - invIB * (pB_ @ lam)
 
-    def _apply_revolute_static_damping(self, lk):
-        """转动副的静态阻尼力矩 (夹紧效果)。
+    def _apply_revolute_static_damping(self, lk, h):
+        """转动副的库仑静摩擦 / 滑动摩擦 (角冲量式)。
 
-        模拟铰链处的夹紧装置: 抵抗两端的相对转动, 力矩方向与相对角
-        速度相反。用 tanh 平滑以避免零点抖动, 数值越大夹紧越强。
-        仅在 Link.static_damping > 0 时生效。
+        物理意义: 铰链处的夹紧装置最多提供 ±M_max 的抗转动力矩。
+
+        模型:
+          - 消除相对角速度 ω_rel 所需角冲量 j_req = -ω_rel / k_eff
+          - 若 |j_req| ≤ M_max·h: 静摩擦, 施加 j_req, ω_rel 一步归零
+          - 若 |j_req| >  M_max·h: 滑动摩擦, 施加 ±M_max·h, ω_rel 减小
+
+        其中 k_eff = invI_A + invI_B, 单位一致性:
+            j 的单位是 kg·px²/s (= N·m·s 的内部表示)
+            M_max·h 也是 kg·px²/s, 因为 static_damping 内部单位是 kg·px²/s²
+
+        必须在速度回写之后调用 (直接修改 ω)。一次冲量即让静摩擦态
+        完全停止相对转动, 不需要多次迭代。
         """
         if lk.type != 'revolute': return
-        if lk.static_damping <= 1e-9: return
+        M_max_internal = lk.static_damping * PX_PER_M * PX_PER_M
+        if M_max_internal <= 1e-9: return
         pa, pb = lk.pA.part, lk.pB.part
         if pa.locked and pb.locked: return
+
         omega_rel = pa.omega - pb.omega
-        torque = lk.static_damping * math.tanh(omega_rel * 8.0)
+        invIA = 0.0 if pa.locked else 1.0 / pa.inertia()
+        invIB = 0.0 if pb.locked else 1.0 / pb.inertia()
+        k_eff = invIA + invIB
+        if k_eff < 1e-12: return
+
+        # 消除 ω_rel 所需角冲量
+        j_req = -omega_rel / k_eff
+        j_max = M_max_internal * h
+
+        if abs(j_req) <= j_max:
+            j = j_req                       # 静摩擦: 一步完全停止
+            lk.friction_saturated = False
+        else:
+            j = math.copysign(j_max, j_req) # 滑动摩擦: 提供极限力矩
+            lk.friction_saturated = True
+
         if not pa.locked:
-            pa.tq -= torque
+            pa.omega += j * invIA
         if not pb.locked:
-            pb.tq += torque
+            pb.omega -= j * invIB
 
     def _solve_collision_position(self, pA, pB):
         """碰撞位置约束: 沿最小穿透法线分离两零件的凸包"""
@@ -2358,27 +2417,63 @@ class App:
 
     # ---------------- 受力平衡求解 ----------------
     def _recompute_analysis_for_current_frame(self):
+        """静力平衡求解。
+
+        未知数分配 (关键):
+          - 每条**有 static_damping** 的 revolute 铰链: 3 个未知数 (Fx, Fy, M)
+          - 每条**无 static_damping** 的 revolute 铰链: 2 个未知数 (Fx, Fy)
+
+        物理意义: 无夹紧装置的机械铰链在静力学里不应提供任何抵抗力矩,
+        因此 M 必须为 0。若强行把 M 也作为未知数 (无约束), 那么方程组
+        欠定, Tikhonov 正则化会给出"非零的极小范数解", 造成凭空出现
+        的铰链力矩 (这是一个数值假象, 不是真实的夹紧力)。
+
+        有 static_damping 时 M 为未知数, 表示铰链处的夹紧力矩;
+        求解后若 |M| 超过 static_damping, 则视为滑动摩擦 (饱和)。
+        """
         free = [p for p in self.parts if not p.locked]
         rev  = [lk for lk in self.links if lk.type == 'revolute']
-        if not free or not rev: return
-        nVar = 2 * len(rev); nEq = 3 * len(free)
+        if not free or not rev:
+            return
+
+        # 每条铰链是否引入 M 未知数 (取决于 static_damping)
+        M_limits = [lk.static_damping * PX_PER_M * PX_PER_M for lk in rev]
+        has_M    = [lim > 1e-9 for lim in M_limits]
+
+        # 变量分配: has_M 为 3 个 (Fx, Fy, M); 否则 2 个 (Fx, Fy)
+        var_off = []
+        nVar = 0
+        for hm in has_M:
+            var_off.append(nVar)
+            nVar += 3 if hm else 2
+
+        nEq = 3 * len(free)
         A = np.zeros((nEq, nVar)); b = np.zeros(nEq)
         pidx = {id(p): i for i, p in enumerate(free)}
+
         for j, lk in enumerate(rev):
             pA, pB = lk.pA.part, lk.pB.part
             wJ = lk.pA.world()
+            off = var_off[j]
+            cx = off; cy = off + 1
+            cm = off + 2 if has_M[j] else None
             if id(pB) in pidx:
                 i = pidx[id(pB)]; rB = wJ - pB.pos
-                A[3*i,   2*j]     += 1.0
-                A[3*i+1, 2*j+1]   += 1.0
-                A[3*i+2, 2*j]     += -rB[1]
-                A[3*i+2, 2*j+1]   +=  rB[0]
+                A[3*i,   cx] +=  1.0
+                A[3*i+1, cy] +=  1.0
+                A[3*i+2, cx] += -rB[1]
+                A[3*i+2, cy] +=  rB[0]
+                if cm is not None:
+                    A[3*i+2, cm] +=  1.0
             if id(pA) in pidx:
                 i = pidx[id(pA)]; rA = wJ - pA.pos
-                A[3*i,   2*j]     -= 1.0
-                A[3*i+1, 2*j+1]   -= 1.0
-                A[3*i+2, 2*j]     +=  rA[1]
-                A[3*i+2, 2*j+1]   -=  rA[0]
+                A[3*i,   cx] += -1.0
+                A[3*i+1, cy] += -1.0
+                A[3*i+2, cx] +=  rA[1]
+                A[3*i+2, cy] += -rA[0]
+                if cm is not None:
+                    A[3*i+2, cm] += -1.0
+
         for i, p in enumerate(free):
             Fx, Fy, Tq = 0.0, 0.0, 0.0
             # 本体重力 (只 body_mass)
@@ -2395,8 +2490,6 @@ class App:
                     for pt in (lk.pA, lk.pB):
                         if pt.part is not p: continue
                         sign = 1.0 if pt is lk.pA else -1.0
-                        # 与 _spring_force_components 保持一致:
-                        # 静态分量 = 刚度力 + 限位力 (不含阻尼)
                         comp = self._spring_force_components(lk)
                         F_vec = sign * (comp['base'] + comp['limit'])
                         fx, fy = float(F_vec[0]), float(F_vec[1])
@@ -2420,9 +2513,8 @@ class App:
             b[3*i]   = -Fx
             b[3*i+1] = -Fy
             b[3*i+2] = -Tq
+
         try:
-            # Tikhonov 正则化: 解 (A^T A + eps I) x = A^T b
-            # 避免 A 接近奇异时 lstsq 给出巨大解
             ATA = A.T @ A + REG_EPS * np.eye(A.shape[1])
             ATb = A.T @ b
             sol = np.linalg.solve(ATA, ATb)
@@ -2433,8 +2525,27 @@ class App:
                 return
         except Exception:
             return
+
         for j, lk in enumerate(rev):
-            lk.force = np.array([sol[2*j], sol[2*j+1]])
+            off = var_off[j]
+            lk.force = np.array([sol[off], sol[off+1]])
+            if has_M[j]:
+                M_solved = float(sol[off+2])       # 静力平衡所需的"剩余力矩"
+                M_limit  = M_limits[j]             # 铰链物理上限 ±M_max
+                lk.moment_raw = M_solved
+                if abs(M_solved) > M_limit:
+                    # 所需力矩突破铰链上限 → 滑动摩擦
+                    # 实际提供的力矩被钳制到 ±M_max (物理上不可能超过)
+                    lk.moment = math.copysign(M_limit, M_solved)
+                    lk.friction_saturated = True
+                else:
+                    # 静摩擦: 提供的力矩恰好等于维持平衡所需的剩余力矩
+                    lk.moment = M_solved
+                    lk.friction_saturated = False
+            else:
+                lk.moment = 0.0
+                lk.moment_raw = 0.0
+                lk.friction_saturated = False
 
     # ---------------- 渲染 ----------------
     def redraw(self):
@@ -2493,16 +2604,18 @@ class App:
         if part.id not in cache: return
         data = cache[part.id]
 
-        # ---- 各连接附: 只画力, 不画力矩 ----
+        # ---- 各连接附: 力 + 力矩分量 ----
         for cp_id, cpd in data['cp_forces'].items():
             at = cpd['at']
             if self.analysis_detail == 'simple':
-                # 简略: 各挂接点只画合力
                 self._draw_force_arrow(at, cpd['total_f'], 'total_f')
+                if abs(cpd.get('total_m', 0.0)) > 1e-3:
+                    self._draw_moment_arc(at, cpd['total_m'], 'total_m')
             else:
-                # 详细: 逐个分量 (刚度/限位/阻尼/刚性/磁力/载荷)
                 for kind, F, at_comp in cpd['components']:
                     self._draw_force_arrow(at_comp, F, kind)
+                for kind, M, at_m in cpd.get('moments', []):
+                    self._draw_moment_arc(at_m, M, kind)
 
         # ---- 质心处: 重力 + 总合力矩 ----
         com = data['com_world']
@@ -2510,7 +2623,7 @@ class App:
             self._draw_force_arrow(com, data['gravity'], 'gravity')
 
         total_m = data.get('total_moment', 0.0)
-        if abs(total_m) > 1e-6:
+        if abs(total_m) > 1e-3:
             self._draw_moment_arc(com, total_m, 'total_m')
 
     def _draw_force_arrow(self, at_world, F, kind):
@@ -2554,11 +2667,14 @@ class App:
                                 font=FORCE_LABEL_FONT)
 
     def _draw_moment_arc(self, at_world, M, kind):
-        """力矩圆弧 + 明显箭头 + 数值"""
+        """力矩圆弧 + 明显箭头 + 数值
+
+        单位换算: M 内部单位 kg·px²/s² -> N·m 需除以 PX_PER_M²
+        """
         cfg = FORCE_VIZ.get(kind)
         if cfg is None: return
-        M_Nm = M / PX_PER_M
-        if abs(M_Nm) < 1e-4: return
+        M_Nm = M / (PX_PER_M * PX_PER_M)   # kg·px²/s² -> N·m
+        if abs(M_Nm) < 1e-6: return
         r_world = abs(M_Nm) * MOMENT_SCALE_PX_PER_NM
         if r_world < MOMENT_MIN_WORLD_PX:
             r_world = MOMENT_MIN_WORLD_PX
@@ -3035,8 +3151,8 @@ class App:
             tf = d.get('total_force', np.zeros(2))
             tm = d.get('total_moment', 0.0)
             Fm_N = float(np.linalg.norm(tf)) / PX_PER_M
-            M_Nm = float(tm) / PX_PER_M
-            balanced = (Fm_N < 1e-3 and abs(M_Nm) < 1e-4)
+            M_Nm = float(tm) / (PX_PER_M * PX_PER_M)
+            balanced = (Fm_N < 0.01 and abs(M_Nm) < 1e-3)
             w.configure(fg=('#8bc34a' if balanced else '#ef5350'))
         self._reg_dyn(head_lbl, upd_head)
 
@@ -3067,7 +3183,7 @@ class App:
         make_row('  合力 Y: ', FORCE_VIZ['total_f']['color'],
                  lambda d: f'{float(d.get("total_force", np.zeros(2))[1])/PX_PER_M:+.4f} N')
         make_row('  总合力矩: ', FORCE_VIZ['total_m']['color'],
-                 lambda d: f'{float(d.get("total_moment", 0.0))/PX_PER_M:+.5f} N·m')
+                 lambda d: f'{float(d.get("total_moment", 0.0))/(PX_PER_M*PX_PER_M):+.5f} N·m')
 
         # 平衡状态提示 (动态)
         bal_lbl = tk.Label(p, text='', bg='#3c3f41', fg='#8bc34a',
@@ -3081,7 +3197,7 @@ class App:
             tf = d.get('total_force', np.zeros(2))
             tm = d.get('total_moment', 0.0)
             Fm_N = float(np.linalg.norm(tf)) / PX_PER_M
-            M_Nm = float(tm) / PX_PER_M
+            M_Nm = float(tm) / (PX_PER_M * PX_PER_M)
             balanced = (Fm_N < 1e-3 and abs(M_Nm) < 1e-4)
             w.configure(
                 text=('  OK 静态平衡 (合力/合力矩约为 0)'
@@ -3309,17 +3425,59 @@ class App:
         tk.Label(p, text=f'两端偏差: {dev:.3f} px',
                  bg='#3c3f41', fg='#999999',
                  font=('Consolas', 9)).pack(anchor='w', pady=2)
+
+        # 当前帧的铰链力矩 (静力平衡解 + 物理钳制)
+        M_max = lk.static_damping
+        M_provide_Nm = lk.moment / (PX_PER_M * PX_PER_M)
+        M_needed_Nm  = getattr(lk, 'moment_raw', lk.moment) / (PX_PER_M * PX_PER_M)
+
+        if M_max > 1e-9:
+            if lk.friction_saturated:
+                sat_txt = (f'⚠ 已进入滑动摩擦\n'
+                           f'   需要力矩: {M_needed_Nm:+.5f} N·m\n'
+                           f'   提供力矩: {M_provide_Nm:+.5f} N·m\n'
+                           f'   (已达上限 ±{M_max:.4f} N·m)')
+                sat_col = '#ef5350'
+            else:
+                sat_txt = (f'✓ 静摩擦 (提供所需力矩)\n'
+                           f'   需要力矩: {M_needed_Nm:+.5f} N·m\n'
+                           f'   提供力矩: {M_provide_Nm:+.5f} N·m\n'
+                           f'   (≤ ±{M_max:.4f} N·m)')
+                sat_col = '#8bc34a'
+        else:
+            sat_txt = f'当前铰链力矩: {M_provide_Nm:+.6f} N·m (无夹紧装置)'
+            sat_col = '#999999'
+        tk.Label(p, text=sat_txt, bg='#3c3f41', fg=sat_col,
+                 wraplength=270, justify='left',
+                 font=('Microsoft YaHei', 9)).pack(anchor='w', pady=2)
+
         tk.Frame(p, height=1, bg='#555555').pack(fill='x', pady=6)
 
-        tk.Label(p, text='静态阻尼力矩 (N·m)',
+        tk.Label(p, text='静态摩擦极限力矩 (N·m)',
                  bg='#3c3f41', fg='#cccccc',
                  font=('Microsoft YaHei', 9)).pack(anchor='w')
         var = tk.StringVar(value=f'{lk.static_damping:.4f}')
         entry = tk.Entry(p, textvariable=var, bg='#2b2b2b', fg='#eeeeee',
                          insertbackground='white', relief='flat')
         entry.pack(fill='x', pady=2)
-        tk.Label(p, text='模拟铰链处的夹紧装置: 抵抗相对转动,\n'
-                         '数值越大夹紧越强 (0 = 无夹紧)',
+
+        def _apply_live(_evt=None):
+            try:
+                v = float(var.get())
+            except ValueError:
+                return
+            if v < 0: return
+            if abs(v - lk.static_damping) < 1e-12: return
+            lk.static_damping = v
+            logger.info(f'[revolute] link#{lk.id} static_damping = {v:.4f} '
+                        f'(FocusOut 实时写入)')
+            self.set_status(
+                f'转动副 #{lk.id} 静态阻尼力矩 = {v:.4f} N·m (已写入)')
+        entry.bind('<FocusOut>', _apply_live)
+        entry.bind('<Return>',   _apply_live)
+        tk.Label(p, text='模拟铰链处的夹紧装置: 铰链最多提供 ±M_max 的\n'
+                         '力矩抵抗转动。需要更大时进入滑动摩擦。\n'
+                         '(0 = 无夹紧, 铰链自由转动)',
                  bg='#3c3f41', fg='#888888', justify='left',
                  font=('Microsoft YaHei', 8)).pack(anchor='w', pady=(2, 6))
 
@@ -3522,6 +3680,15 @@ class App:
         new_log = setup_log_for_model(model_name)
         logger.info(f'# 已从 JSON 加载模型: {path}')
         logger.info(f'# 日志切换为: {new_log}')
+        # 打印每条 revolute 铰链的 static_damping 便于诊断
+        for lk in self.links:
+            if lk.type != 'revolute':
+                continue
+            logger.info(
+                f'  [load] link#{lk.id} revolute '
+                f'pA=cp#{lk.pA.id}@part#{lk.pA.part.id} '
+                f'pB=cp#{lk.pB.id}@part#{lk.pB.part.id} '
+                f'static_damping={lk.static_damping:.6f} N·m')
         self.set_status(f'已加载 {path}  (日志: {new_log})')
 
 
