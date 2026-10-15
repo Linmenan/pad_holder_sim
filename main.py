@@ -99,8 +99,8 @@ GRAVITY    = 9.81 * PX_PER_M
 SUBSTEPS   = 8
 ITERATIONS = 16
 DT_MAX     = 0.033
-ANG_DAMP   = 1.5
-LIN_DAMP   = 0.8
+ANG_DAMP   = 0.0               # 全局转动阻尼
+LIN_DAMP   = 0.0               # 全局线型阻尼
 SNAP_PX    = 26.0
 
 DRAG_MAX_STEP   = 60.0
