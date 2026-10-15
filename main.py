@@ -385,6 +385,7 @@ class Link:
         self.type = type_
         pA.link = pB; pB.link = pA
         self.force = np.zeros(2)
+        self.lmin  = 50.0
         self.l0    = 100.0
         self.lmax  = 200.0
         self.k     = 100.0
@@ -751,8 +752,7 @@ class Simulator:
                         if lk.type != 'spring': continue
                         L = float(np.linalg.norm(
                             lk.pB.world() - lk.pA.world()))
-                        is_comp = lk.lmax < lk.l0
-                        hit = (L < lk.lmax) if is_comp else (L > lk.lmax)
+                        hit = (L <= lk.lmin or L >= lk.lmax)
                         va = lk.pA.part.v + lk.pA.part.omega * perp(
                             rot(lk.pA.part.angle) @ lk.pA.local)
                         vb = lk.pB.part.v + lk.pB.part.omega * perp(
@@ -765,7 +765,7 @@ class Simulator:
                             v_rel = 0.0
                         lines.append(
                             f'  spring#{lk.id} L={L:.4f} '
-                            f'l0={lk.l0:.2f} lmax={lk.lmax:.2f} '
+                            f'limits=[{lk.lmin:.2f}, {lk.lmax:.2f}] l0={lk.l0:.2f} '
                             f'v_rel={v_rel:+.4f} hit={hit} '
                             f'active={lk.limit_active}')
                     logger.debug('\n'.join(lines))
@@ -1346,7 +1346,8 @@ class App:
             L = natural_length if natural_length else \
                 float(np.linalg.norm(pA.world() - pB.world()))
             lk.l0    = max(L, 30.0)
-            lk.lmax  = max(L * 1.4, 60.0)
+            lk.lmin  = max(L * 0.4, 10.0)
+            lk.lmax  = max(L * 1.6, 60.0)
             lk.k     = 100.0
             lk.c     = 5.0
         elif type_ == 'magnet':
@@ -1452,15 +1453,81 @@ class App:
             pb.pos   = pb.pos   + invMB * lam
             pb.angle = pb.angle + invIB * (pB_ @ lam)
 
+    def _project_spring_limit_on_pos(self, lk):
+        """装配阶段拖拽专用：弹簧硬限位位置投影"""
+        pa, pb = lk.pA, lk.pB
+        pA, pB = pa.part, pb.part
+        wa = pa.world(); wb = pb.world()
+        d = wb - wa
+        L = float(np.linalg.norm(d))
+        if L < 1e-9: return 0.0
+        u = d / L
+        if L <= lk.lmin:
+            C = L - lk.lmin
+        elif L >= lk.lmax:
+            C = L - lk.lmax
+        else:
+            return 0.0
+        
+        invMA = 0.0 if pA.locked else 1.0 / pA.all_mass()
+        invMB = 0.0 if pB.locked else 1.0 / pB.all_mass()
+        invIA = 0.0 if pA.locked else 1.0 / pA.inertia()
+        invIB = 0.0 if pB.locked else 1.0 / pB.inertia()
+        
+        rA = rot(pA.angle) @ pa.local
+        rB = rot(pB.angle) @ pb.local
+        pA_ = perp(rA); pB_ = perp(rB)
+        
+        k_eff = (invMA + invMB) + invIA * float(pA_ @ u) ** 2 + invIB * float(pB_ @ u) ** 2
+        if k_eff < 1e-12: return 0.0
+        lam = C / k_eff
+        
+        if not pA.locked:
+            pA.pos   = pA.pos   + invMA * lam * u
+            pA.angle = pA.angle + invIA * float(pA_ @ u) * lam
+        if not pB.locked:
+            pB.pos   = pB.pos   - invMB * lam * u
+            pB.angle = pB.angle - invIB * float(pB_ @ u) * lam
+        return abs(C)
+
+    def _project_collision_on_pos(self, pA, pB):
+        """装配阶段拖拽专用：碰撞硬限位位置投影"""
+        if pA.locked and pB.locked: return 0.0
+        if len(pA.hull) < 3 or len(pB.hull) < 3: return 0.0
+        polyA = [pA.pos + rot(pA.angle) @ v for v in pA.hull]
+        polyB = [pB.pos + rot(pB.angle) @ v for v in pB.hull]
+        overlap, normal, depth = convex_polygons_sat(polyA, polyB)
+        if not overlap or depth < 1e-6: return 0.0
+        invMA = 0.0 if pA.locked else 1.0 / pA.all_mass()
+        invMB = 0.0 if pB.locked else 1.0 / pB.all_mass()
+        tot = invMA + invMB
+        if tot < 1e-12: return 0.0
+        if not pA.locked:
+            pA.pos = pA.pos - normal * depth * (invMA / tot)
+        if not pB.locked:
+            pB.pos = pB.pos + normal * depth * (invMB / tot)
+        return depth
+
     def _correct_all_constraints(self):
-        for _ in range(CORRECTION_ITER):
+        """拖拽中求解所有约束 (调整为铰链最后执行，确保硬约束不被破坏)"""
+        for _ in range(CORRECTION_ITER * 2):  # 略微增加迭代次数保障收敛
             max_err = 0.0
+            # 1. 先求解弹簧双边界限位
             for lk in self.links:
-                if lk.type != 'revolute': continue
-                if lk.pA.part.locked and lk.pB.part.locked: continue
-                err = float(np.linalg.norm(lk.pA.world() - lk.pB.world()))
+                if lk.type == 'spring':
+                    err = self._project_spring_limit_on_pos(lk)
+                    if err > max_err: max_err = err
+            # 2. 求解碰撞分离
+            for (pA, pB) in self.collisions:
+                err = self._project_collision_on_pos(pA, pB)
                 if err > max_err: max_err = err
-                self._project_revolute(lk)
+            # 3. 最后求解转动副铰链 (具有最高优先级，确保强制贴合不拉断)
+            for lk in self.links:
+                if lk.type == 'revolute':
+                    if lk.pA.part.locked and lk.pB.part.locked: continue
+                    err = float(np.linalg.norm(lk.pA.world() - lk.pB.world()))
+                    if err > max_err: max_err = err
+                    self._project_revolute(lk)
             if max_err < 1e-4: break
 
     def _build_jacobian(self, free_parts):
@@ -2097,14 +2164,12 @@ class App:
                 if lk.limit_active:
                     pa, pb = lk.pA, lk.pB
                     L_now = float(np.linalg.norm(pb.world() - pa.world()))
-                    is_comp = lk.lmax < lk.l0
-                    still_on = (L_now < lk.lmax) if is_comp \
-                               else (L_now > lk.lmax)
+                    still_on = (L_now <= lk.lmin or L_now >= lk.lmax)
                     if not still_on:
                         lk.limit_active = False
                         logger.info(
                             f'[LIMIT-OFF] link#{lk.id} '
-                            f'L={L_now:.4f} lmax={lk.lmax:.4f} (released)')
+                            f'L={L_now:.4f} limits=[{lk.lmin:.4f}, {lk.lmax:.4f}] (released)')
 
         # 碰撞速度约束 (非弹性, 法向相对速度归零, 吸收动能)
         for (pA, pB) in self.collisions:
@@ -2138,13 +2203,10 @@ class App:
         F_damp_base = lk.c * v_rel
 
         F_limit_stiff = 0.0
-        is_compression = lk.lmax < lk.l0
-        if is_compression:
-            if L < lk.lmax:
-                F_limit_stiff = lk.k * LIMIT_STIFFNESS_MULT * (L - lk.lmax)
-        else:
-            if L > lk.lmax:
-                F_limit_stiff = lk.k * LIMIT_STIFFNESS_MULT * (L - lk.lmax)
+        if L < lk.lmin:
+            F_limit_stiff = lk.k * LIMIT_STIFFNESS_MULT * (L - lk.lmin)
+        elif L > lk.lmax:
+            F_limit_stiff = lk.k * LIMIT_STIFFNESS_MULT * (L - lk.lmax)
 
         return {
             'base':  F_base        * u,
@@ -2185,15 +2247,12 @@ class App:
             return
         u = d / L
 
-        is_compression = lk.lmax < lk.l0
-        if is_compression:
-            if L >= lk.lmax:
-                return                                  # 未到限位
-            stop_dir = -1                               # 压簧: 继续压缩才截停
+        if L <= lk.lmin:
+            stop_dir = -1  # 触及下限，防止继续压缩
+        elif L >= lk.lmax:
+            stop_dir = +1  # 触及上限，防止继续拉伸
         else:
-            if L <= lk.lmax:
-                return                                  # 未到限位
-            stop_dir = +1                               # 拉簧: 继续拉伸才截停
+            return
 
         rA = rot(pA.angle) @ pa.local
         rB = rot(pB.angle) @ pb.local
@@ -2396,13 +2455,12 @@ class App:
         if L < 1e-9: return
         u = d / L
 
-        is_compression = lk.lmax < lk.l0
-        if is_compression:
-            if L >= lk.lmax: return
+        if L <= lk.lmin:
+            C = L - lk.lmin
+        elif L >= lk.lmax:
+            C = L - lk.lmax
         else:
-            if L <= lk.lmax: return
-
-        C = L - lk.lmax                # 拉簧: C > 0; 压簧: C < 0
+            return
 
         invMA = 0.0 if pA.locked else 1.0 / pA.all_mass()
         invMB = 0.0 if pB.locked else 1.0 / pB.all_mass()
@@ -2428,10 +2486,10 @@ class App:
         # ---- 状态切换日志 (一次性, 只在触发/释放瞬间写) ----
         if not lk.limit_active:
             lk.limit_active = True
-            kind = 'COMPRESSION' if is_compression else 'TENSION'
+            kind = 'COMPRESSION' if C < 0 else 'TENSION'
             logger.warning(
                 f'[LIMIT-ON ] link#{lk.id} kind={kind} '
-                f'L={L:.4f} lmax={lk.lmax:.4f} C={C:+.4f} '
+                f'L={L:.4f} limits=[{lk.lmin:.4f}, {lk.lmax:.4f}] C={C:+.4f} '
                 f'k_eff={k_eff:.3e} lam={lam:+.3e} '
                 f'pA.part#{pA.id}(locked={pA.locked}) '
                 f'pB.part#{pB.id}(locked={pB.locked})')
@@ -2602,6 +2660,9 @@ class App:
             self.canvas.create_rectangle(x0, y0, x1, y1,
                                          outline='#2196f3', dash=(5, 3), width=2)
 
+        # 拖拽时的约束限制可视化 (弹簧极限圆弧辅助线)
+        self._draw_spring_limits_overlay()
+
         # 受力可视化 (只在仿真阶段 / 有缓存 / 选中零件 / analysis_detail != off)
         if (self.stage == 'simulate'
                 and self.analysis_detail != 'off'
@@ -2618,6 +2679,44 @@ class App:
         }[self.stage]
         c.create_text(10, H - 12, anchor='sw', fill='#999999',
                       font=('Microsoft YaHei', 8), text=tip)
+
+    def _draw_spring_limits_overlay(self):
+        if self.stage != 'assemble': return
+        # 仅当正在拖动某个零件时触发视觉辅助
+        if not (self.dragging and self.dragging[0] == 'part'): return
+        drag_part = self.dragging[1]
+        
+        for lk in self.links:
+            if lk.type != 'spring': continue
+            is_A_drag = (lk.pA.part is drag_part)
+            is_B_drag = (lk.pB.part is drag_part)
+            # 确保至少有一端没被拖动（如果是连着一起拖的不画）
+            if is_A_drag and not is_B_drag:
+                center_pt = lk.pB
+            elif is_B_drag and not is_A_drag:
+                center_pt = lk.pA
+            else:
+                continue
+            
+            c_s = self.w2s(center_pt.world())
+            
+            rmin = lk.lmin * self.zoom
+            r0   = lk.l0 * self.zoom
+            rmax = lk.lmax * self.zoom
+            
+            # 压缩极限制动辅助线 (最短)
+            self.canvas.create_oval(c_s[0]-rmin, c_s[1]-rmin, c_s[0]+rmin, c_s[1]+rmin, 
+                                    outline='#ef5350', dash=(4, 4), width=2)
+            # 初始长度辅助线
+            self.canvas.create_oval(c_s[0]-r0, c_s[1]-r0, c_s[0]+r0, c_s[1]+r0, 
+                                    outline='#8bc34a', dash=(4, 4), width=1)
+            # 拉伸极限制动辅助线 (最长)
+            self.canvas.create_oval(c_s[0]-rmax, c_s[1]-rmax, c_s[0]+rmax, c_s[1]+rmax, 
+                                    outline='#ef5350', dash=(4, 4), width=2)
+                                    
+            self.canvas.create_text(c_s[0], c_s[1] - rmin + 8, text='限位下界', fill='#ef5350', font=('Microsoft YaHei', 8, 'bold'))
+            self.canvas.create_text(c_s[0], c_s[1] - r0 - 6, text='初始 L0', fill='#8bc34a', font=('Microsoft YaHei', 8))
+            self.canvas.create_text(c_s[0], c_s[1] - rmax - 6, text='限位上界', fill='#ef5350', font=('Microsoft YaHei', 8, 'bold'))
 
     # ---------------- 受力可视化 ----------------
     def _draw_part_forces(self, part):
@@ -2979,27 +3078,21 @@ class App:
         
         Lw = float(np.linalg.norm(lk.pB.world() - lk.pA.world()))
         
-        # 智能动态颜色: 根据偏离初始长度的程度渐变到红色 (#c62828)
-        if lk.lmax < lk.l0:
-            # 压簧
-            if Lw >= lk.l0:
-                col = '#546e7a'
-            else:
-                ratio = min(1.0, (lk.l0 - Lw) / max(0.1, lk.l0 - lk.lmax))
-                r = int(0x54 + ratio * (0xc6 - 0x54))
-                g = int(0x6e + ratio * (0x28 - 0x6e))
-                b = int(0x7a + ratio * (0x28 - 0x7a))
-                col = f'#{r:02x}{g:02x}{b:02x}'
+        # 智能动态颜色: 双边渐变到红色 (#c62828)
+        if Lw <= lk.lmin or Lw >= lk.lmax:
+            col = '#c62828'
+        elif Lw < lk.l0:
+            ratio = min(1.0, (lk.l0 - Lw) / max(0.1, lk.l0 - lk.lmin))
+            r = int(0x54 + ratio * (0xc6 - 0x54))
+            g = int(0x6e + ratio * (0x28 - 0x6e))
+            b = int(0x7a + ratio * (0x28 - 0x7a))
+            col = f'#{r:02x}{g:02x}{b:02x}'
         else:
-            # 拉簧
-            if Lw <= lk.l0:
-                col = '#546e7a'
-            else:
-                ratio = min(1.0, (Lw - lk.l0) / max(0.1, lk.lmax - lk.l0))
-                r = int(0x54 + ratio * (0xc6 - 0x54))
-                g = int(0x6e + ratio * (0x28 - 0x6e))
-                b = int(0x7a + ratio * (0x28 - 0x7a))
-                col = f'#{r:02x}{g:02x}{b:02x}'
+            ratio = min(1.0, (Lw - lk.l0) / max(0.1, lk.lmax - lk.l0))
+            r = int(0x54 + ratio * (0xc6 - 0x54))
+            g = int(0x6e + ratio * (0x28 - 0x6e))
+            b = int(0x7a + ratio * (0x28 - 0x7a))
+            col = f'#{r:02x}{g:02x}{b:02x}'
                 
         sel = bool(self.sel and self.sel[0] == 'link' and self.sel[1] is lk)
         w = 3 if sel else 2
@@ -3535,11 +3628,35 @@ class App:
                  bg='#3c3f41', fg='#cccccc',
                  font=('Consolas', 9)).pack(anchor='w', pady=2)
         tk.Frame(p, height=1, bg='#555555').pack(fill='x', pady=6)
+        
+        def _set_spring_len(lk_obj, prop, val_str):
+            try: v = float(val_str)
+            except ValueError: return
+            if v < 1.0: v = 1.0
+            setattr(lk_obj, prop, v)
+            
+            # 合法性强制联调联动: lmin <= l0 <= lmax
+            if prop == 'lmin':
+                if lk_obj.l0 < lk_obj.lmin: lk_obj.l0 = lk_obj.lmin
+                if lk_obj.lmax < lk_obj.lmin: lk_obj.lmax = lk_obj.lmin
+            elif prop == 'l0':
+                if lk_obj.lmin > lk_obj.l0: lk_obj.lmin = lk_obj.l0
+                if lk_obj.lmax < lk_obj.l0: lk_obj.lmax = lk_obj.l0
+            elif prop == 'lmax':
+                if lk_obj.l0 > lk_obj.lmax: lk_obj.l0 = lk_obj.lmax
+                if lk_obj.lmin > lk_obj.lmax: lk_obj.lmin = lk_obj.lmax
+            
+            self._touch()
+            self.update_props()
+            self.redraw()
+
         if lk.type == 'spring':
+            self._field(p, '最短长度', f'{lk.lmin:.1f}',
+                        lambda v: _set_spring_len(lk, 'lmin', v))
             self._field(p, '初始长度', f'{lk.l0:.1f}',
-                        lambda v: self._set_attr(lk, 'l0', v))
-            self._field(p, '极限长度', f'{lk.lmax:.1f}',
-                        lambda v: self._set_attr(lk, 'lmax', v))
+                        lambda v: _set_spring_len(lk, 'l0', v))
+            self._field(p, '最大长度', f'{lk.lmax:.1f}',
+                        lambda v: _set_spring_len(lk, 'lmax', v))
             self._field(p, '刚度 k', f'{lk.k:.1f}',
                         lambda v: self._set_attr(lk, 'k', v))
             self._field(p, '阻尼 c', f'{lk.c:.2f}',
@@ -3749,6 +3866,7 @@ class App:
                 'pB_part_id': lk.pB.part.id,
                 'pB_id': lk.pB.id,
                 'type': lk.type,
+                'lmin': float(lk.lmin),
                 'l0': float(lk.l0),
                 'lmax': float(lk.lmax),
                 'k': float(lk.k),
@@ -3820,6 +3938,7 @@ class App:
             lk.id = ld['id']
             lk.l0    = float(ld.get('l0', 100.0))
             lk.lmax  = float(ld.get('lmax', 200.0))
+            lk.lmin  = float(ld.get('lmin', lk.l0 * 0.5))
             lk.k     = float(ld.get('k', 100.0))
             lk.c     = float(ld.get('c', 5.0))
             lk.mk    = float(ld.get('mk', 500.0))
