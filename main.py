@@ -488,8 +488,11 @@ class Simulator:
             I_kgm2 = p.inertia() / (PX_PER_M ** 2)
             ek += 0.5 * I_kgm2 * (p.omega ** 2)
             
-            com_world = p.l2w(p.com_local())
-            ep_g += p.all_mass() * 9.81 * (-com_world[1] / PX_PER_M)
+            # 必须严格与物理引擎积分所采用的受力点保持一致，分离本体质量与载荷质量的势能计算
+            ep_g += p.body_mass * 9.81 * (-p.pos[1] / PX_PER_M)
+            for cp in p.points:
+                if cp.type == 'payload' and cp.mass > 0:
+                    ep_g += cp.mass * 9.81 * (-cp.world()[1] / PX_PER_M)
             
         for lk in self.app.links:
             if lk.type == 'spring':
@@ -754,6 +757,7 @@ class Simulator:
                         logger.info(
                             f'[stable] 到达稳态 step={self.step_counter} '
                             f'frames={len(self.frames)}')
+                        print(f"仿真自动停止: 夹紧阻力致使系统速度/角速度归零并保持稳定 (共生成 {len(self.frames)} 帧)。")
                         # 输出最后一帧每零件平衡检查
                         if self.force_cache:
                             last = self.force_cache[-1]
@@ -774,38 +778,54 @@ class Simulator:
                 else:
                     self.stable_count = 0
 
-                # 每 20 步记录一次运行状态 (含每根弹簧的完整状态)
-                if self.step_counter % 20 == 0:
-                    lines = [f'[RUN] step={self.step_counter} '
-                             f'frame={len(self.frames)}']
+                # 每记录一帧 (SIM_FRAME_INTERVAL) 记录一次完整运行状态 (含受力, 能量, 加速度等)
+                if self.step_counter % SIM_FRAME_INTERVAL == 0:
+                    idx = len(self.frames) - 1
+                    eng = self.energy_cache[idx] if idx < len(self.energy_cache) else {'e_tot':0, 'ek':0, 'ep_g':0, 'ep_e':0}
+                    lines = [f'[RUN] step={self.step_counter} frame={idx} '
+                             f'E_tot={eng["e_tot"]:.5f} Ek={eng["ek"]:.5f} '
+                             f'Ep_g={eng["ep_g"]:.5f} Ep_e={eng["ep_e"]:.5f}']
+                    
+                    fc = self.force_cache[idx] if idx < len(self.force_cache) else {}
+                    
                     for p in self.app.parts:
                         if p.locked: continue
+                        pf = fc.get(p.id, {})
+                        tf = pf.get('total_force', np.zeros(2)) / PX_PER_M
+                        tm = pf.get('total_moment', 0.0) / (PX_PER_M**2)
+                        acc_x = tf[0] / p.all_mass()
+                        acc_y = tf[1] / p.all_mass()
+                        alpha = tm / (p.inertia() / (PX_PER_M**2))
+                        
                         lines.append(
                             f'  part#{p.id} "{p.name}" '
                             f'pos=({p.pos[0]:+.2f},{p.pos[1]:+.2f}) '
                             f'ang={math.degrees(p.angle):+.2f}deg '
-                            f'v=({p.v[0]:+.3f},{p.v[1]:+.3f}) '
-                            f'w={p.omega:+.4f}')
+                            f'v=({p.v[0]:+.3f},{p.v[1]:+.3f}) w={p.omega:+.4f} '
+                            f'a=({acc_x:+.2f},{acc_y:+.2f}) alpha={alpha:+.3f} '
+                            f'F_tot=({tf[0]:+.2f},{tf[1]:+.2f}) M_tot={tm:+.4f}')
+                            
                     for lk in self.app.links:
-                        if lk.type != 'spring': continue
-                        L = float(np.linalg.norm(
-                            lk.pB.world() - lk.pA.world()))
-                        hit = (L <= lk.lmin or L >= lk.lmax)
-                        va = lk.pA.part.v + lk.pA.part.omega * perp(
-                            rot(lk.pA.part.angle) @ lk.pA.local)
-                        vb = lk.pB.part.v + lk.pB.part.omega * perp(
-                            rot(lk.pB.part.angle) @ lk.pB.local)
-                        dvec = lk.pB.world() - lk.pA.world()
-                        if np.linalg.norm(dvec) > 1e-9:
-                            u = dvec / np.linalg.norm(dvec)
-                            v_rel = float((vb - va) @ u)
-                        else:
-                            v_rel = 0.0
-                        lines.append(
-                            f'  spring#{lk.id} L={L:.4f} '
-                            f'limits=[{lk.lmin:.2f}, {lk.lmax:.2f}] l0={lk.l0:.2f} '
-                            f'v_rel={v_rel:+.4f} hit={hit} '
-                            f'active={lk.limit_active}')
+                        if lk.type == 'revolute':
+                            M_prov = lk.moment / (PX_PER_M**2)
+                            M_req = getattr(lk, 'moment_raw', 0.0) / (PX_PER_M**2)
+                            F_cx = lk.force[0] / PX_PER_M
+                            F_cy = lk.force[1] / PX_PER_M
+                            lines.append(
+                                f'  revolute#{lk.id} pA=part{lk.pA.part.id} pB=part{lk.pB.part.id} '
+                                f'F_c=({F_cx:+.2f},{F_cy:+.2f}) '
+                                f'M_prov={M_prov:+.5f} M_req={M_req:+.5f} sat={lk.friction_saturated}')
+                        elif lk.type == 'spring':
+                            L = float(np.linalg.norm(lk.pB.world() - lk.pA.world()))
+                            hit = (L <= lk.lmin or L >= lk.lmax)
+                            va = lk.pA.part.v + lk.pA.part.omega * perp(rot(lk.pA.part.angle) @ lk.pA.local)
+                            vb = lk.pB.part.v + lk.pB.part.omega * perp(rot(lk.pB.part.angle) @ lk.pB.local)
+                            dvec = lk.pB.world() - lk.pA.world()
+                            v_rel = float((vb - va) @ (dvec / np.linalg.norm(dvec))) if np.linalg.norm(dvec) > 1e-9 else 0.0
+                            lines.append(
+                                f'  spring#{lk.id} L={L:.4f} '
+                                f'limits=[{lk.lmin:.2f}, {lk.lmax:.2f}] l0={lk.l0:.2f} '
+                                f'v_rel={v_rel:+.4f} hit={hit} active={lk.limit_active}')
                     logger.debug('\n'.join(lines))
         except Exception as ex:
             self.state = 'error'
@@ -1252,15 +1272,18 @@ class App:
     def sim_start(self):
         if self.stage != 'simulate': return
         
-        # 只在点击开始仿真时记录一次日志文件
-        global _LOG_FILE_HANDLER
-        if _LOG_FILE_HANDLER is None:
-            setup_log_for_model(self.model_name)
-            logger.info(f'# 仿真日志开始: {LOG_PATH}')
+        # 每次点击开始仿真都强制新建/重置日志文件，彻底解决无日志产生的问题
+        setup_log_for_model(self.model_name)
+        abs_log = os.path.abspath(LOG_PATH) if LOG_PATH else "未知路径"
+        logger.info(f'# 仿真日志开始: {abs_log}')
+        print(f"日志文件已生成至: {abs_log}")
             
         self.sim.start()
         self.refresh_sim_ui()
         self.redraw()
+        
+        # 将日志绝对路径显示在底部状态栏，方便直接找到文件
+        self.set_status(f'仿真已开始。日志正在写入: {abs_log}')
 
     def sim_stop(self):
         self.sim.stop()
@@ -2246,13 +2269,21 @@ class App:
         for p in self.parts:
             p.f[:] = 0.0; p.tq = 0.0
             if not p.locked:
-                p.f[1] += p.all_mass() * GRAVITY
+                # 本体重力直接作用在原点
+                p.f[1] += p.body_mass * GRAVITY
+                # 载荷独立作用并产生偏心力矩
+                for cp in p.points:
+                    if cp.type == 'payload' and cp.mass > 0:
+                        Fpy = cp.mass * GRAVITY
+                        p.f[1] += Fpy
+                        r = cp.world() - p.pos
+                        p.tq += r[0] * Fpy
+
         for lk in self.links:
             if lk.type == 'spring': self._apply_spring(lk)
             elif lk.type == 'magnet': self._apply_magnet(lk)
-            # 注意: 转动副静摩擦不在力累加阶段调用。
-            # 它是角冲量, 直接修改 omega, 必须在速度回写之后调用
-            # (见本方法末尾的 _apply_revolute_static_damping(lk, h))。
+            if lk.type == 'revolute': lk.fric_lam = 0.0  # 初始化 XPBD 摩擦乘子
+
         for p in self.parts:
             if p.locked: continue
             m = p.all_mass(); I = p.inertia()
@@ -2272,6 +2303,7 @@ class App:
             for lk in self.links:
                 if lk.type == 'revolute':
                     self._solve_revolute(lk)
+                    self._solve_revolute_friction_position(lk, h)
             # 弹簧限位位置约束 (硬约束, 恢复系数=0)
             for lk in self.links:
                 if lk.type == 'spring':
@@ -2286,17 +2318,6 @@ class App:
             p.omega = (p.pred_angle - p.angle) / h
             p.pos = p.pred_pos.copy()
             p.angle = p.pred_angle
-
-        # 转动副静摩擦 (角冲量式, 直接作用于 ω)
-        # 迭代 FRICTION_ITER 次以处理多铰链耦合:
-        #   - 单铰链时一次即精确归零 ω_rel
-        #   - 当多个铰链共享同一零件时, 后一个铰链的冲量会改变前一个
-        #     铰链的相对角速度, 通过 Gauss-Seidel 迭代逐步收敛,
-        #     保证每个铰链的残余 ω_rel 都趋于零 → 静摩擦保持
-        for _fric_it in range(FRICTION_ITER):
-            for lk in self.links:
-                if lk.type == 'revolute':
-                    self._apply_revolute_static_damping(lk, h)
 
         # 弹簧限位速度级截停 (二次校正, 清除残余 v_rel)
         for lk in self.links:
@@ -2485,22 +2506,13 @@ class App:
             pb.pred_pos   = pb.pred_pos   - invMB * lam
             pb.pred_angle = pb.pred_angle - invIB * (pB_ @ lam)
 
-    def _apply_revolute_static_damping(self, lk, h):
-        """转动副的库仑静摩擦 / 滑动摩擦 (角冲量式)。
-
-        物理意义: 铰链处的夹紧装置最多提供 ±M_max 的抗转动力矩。
-
-        模型:
-          - 消除相对角速度 ω_rel 所需角冲量 j_req = -ω_rel / k_eff
-          - 若 |j_req| ≤ M_max·h: 静摩擦, 施加 j_req, ω_rel 一步归零
-          - 若 |j_req| >  M_max·h: 滑动摩擦, 施加 ±M_max·h, ω_rel 减小
-
-        其中 k_eff = invI_A + invI_B, 单位一致性:
-            j 的单位是 kg·px²/s (= N·m·s 的内部表示)
-            M_max·h 也是 kg·px²/s, 因为 static_damping 内部单位是 kg·px²/s²
-
-        必须在速度回写之后调用 (直接修改 ω)。一次冲量即让静摩擦态
-        完全停止相对转动, 不需要多次迭代。
+    def _solve_revolute_friction_position(self, lk, h):
+        """基于 XPBD 的位置级干摩擦约束
+        
+        彻底解决“假想静止”和虚假能量注入问题。
+        改进原理: 在施加摩擦角度修正时，要求刚体绕“铰链点”旋转而不是绕“质心”旋转。
+        这不仅符合真实物理的阻碍机制，且保证修改角度时铰链点绝对坐标不动，
+        避免下一轮 _solve_revolute 重新扯平带来的震荡和能量注入。
         """
         if lk.type != 'revolute': return
         M_max_internal = lk.static_damping * PX_PER_M * PX_PER_M
@@ -2508,29 +2520,60 @@ class App:
         pa, pb = lk.pA.part, lk.pB.part
         if pa.locked and pb.locked: return
 
-        omega_rel = pa.omega - pb.omega
-        invIA = 0.0 if pa.locked else 1.0 / pa.inertia()
-        invIB = 0.0 if pb.locked else 1.0 / pb.inertia()
-        k_eff = invIA + invIB
+        # 本子步内的相对旋转角变化量
+        delta_theta = (pa.pred_angle - pa.angle) - (pb.pred_angle - pb.angle)
+
+        # 获取连接点到质心的向量
+        rA = rot(pa.pred_angle) @ lk.pA.local
+        rB = rot(pb.pred_angle) @ lk.pB.local
+        
+        # 使用绕铰链点的等效转动惯量: I_eff = I + m * |r|^2
+        IA_eff = pa.inertia() + pa.all_mass() * float(rA[0]**2 + rA[1]**2)
+        IB_eff = pb.inertia() + pb.all_mass() * float(rB[0]**2 + rB[1]**2)
+
+        invIA_eff = 0.0 if pa.locked else 1.0 / IA_eff
+        invIB_eff = 0.0 if pb.locked else 1.0 / IB_eff
+        
+        k_eff = invIA_eff + invIB_eff
         if k_eff < 1e-12: return
 
-        # 消除 ω_rel 所需角冲量
-        j_req = -omega_rel / k_eff
-        j_max = M_max_internal * h
+        # 消除此相对旋转所需的拉格朗日乘子 (位置冲量)
+        lam_needed = -delta_theta / k_eff
 
-        if abs(j_req) <= j_max:
-            j = j_req                       # 静摩擦: 一步完全停止
-            lk.friction_saturated = False
-        else:
-            j = math.copysign(j_max, j_req) # 滑动摩擦: 提供极限力矩
+        # XPBD 累加乘子并限幅 (摩擦力矩的最大乘子等于 M_max * h^2)
+        target_lam = lk.fric_lam + lam_needed
+        lam_max = M_max_internal * h * h
+
+        if target_lam > lam_max:
+            clamped_lam = lam_max
             lk.friction_saturated = True
+        elif target_lam < -lam_max:
+            clamped_lam = -lam_max
+            lk.friction_saturated = True
+        else:
+            clamped_lam = target_lam
+            lk.friction_saturated = False
 
+        d_lam = clamped_lam - lk.fric_lam
+        lk.fric_lam = clamped_lam
+
+        # 应用角度和位置修正，确保修改姿态时连接点保持原位不动！
         if not pa.locked:
-            pa.omega += j * invIA
-            pa.angle += j * invIA * h  # 同步修正位置层面的漂移，彻底消除夹紧力矩抗转动时的蠕变现象
+            wA_old = pa.pred_pos + rot(pa.pred_angle) @ lk.pA.local
+            pa.pred_angle += d_lam * invIA_eff
+            rA_new = rot(pa.pred_angle) @ lk.pA.local
+            pa.pred_pos = wA_old - rA_new
+            
         if not pb.locked:
-            pb.omega -= j * invIB
-            pb.angle -= j * invIB * h
+            wB_old = pb.pred_pos + rot(pb.pred_angle) @ lk.pB.local
+            pb.pred_angle -= d_lam * invIB_eff
+            rB_new = rot(pb.pred_angle) @ lk.pB.local
+            pb.pred_pos = wB_old - rB_new
+            
+        # 记录实际物理提供的力矩
+        # 翻转符号：在 UI 可视化及静力学网络约定中，对端施加的阻力矩符号定义为反相。
+        # 加上负号后才能保证力矩显示与当前零件运动趋势严格相反（起到阻碍作用）。
+        lk.moment = -lk.fric_lam / (h * h)
 
     def _solve_collision_position(self, pA, pB):
         """碰撞位置约束: 沿最小穿透法线分离两零件的凸包"""
@@ -2755,18 +2798,23 @@ class App:
             off = var_off[j]
             lk.force = np.array([sol[off], sol[off+1]])
             if has_M[j]:
-                M_solved = float(sol[off+2])       # 静力平衡所需的"剩余力矩"
+                M_solved = float(sol[off+2])       # 静力平衡所需的"理论阻力矩"
                 M_limit  = M_limits[j]             # 铰链物理上限 ±M_max
+                
                 lk.moment_raw = M_solved
-                if abs(M_solved) > M_limit:
-                    # 所需力矩突破铰链上限 → 滑动摩擦
-                    # 实际提供的力矩被钳制到 ±M_max (物理上不可能超过)
-                    lk.moment = math.copysign(M_limit, M_solved)
-                    lk.friction_saturated = True
+                
+                # 处于动力学状态时，强制从物理引擎底层采信实际作功的夹紧力矩
+                # （此值在 XPBD 中自然满足静力时不大于峰值、滑动时恰好等于峰值的需求）
+                if self.sim.state in ('computing', 'stable', 'playback') and self.sim.frames:
+                    pass
                 else:
-                    # 静摩擦: 提供的力矩恰好等于维持平衡所需的剩余力矩
-                    lk.moment = M_solved
-                    lk.friction_saturated = False
+                    # 装配阶段/设计阶段，没有运行动力学时，使用静态推导展示
+                    if abs(M_solved) > M_limit:
+                        lk.moment = math.copysign(M_limit, M_solved)
+                        lk.friction_saturated = True
+                    else:
+                        lk.moment = M_solved
+                        lk.friction_saturated = False
             else:
                 lk.moment = 0.0
                 lk.moment_raw = 0.0
@@ -2897,9 +2945,16 @@ class App:
             else:
                 c.create_line(pad_l, y_bot, W - pad_r, y_bot, fill='#555555', dash=(4,4))
                 
+            # 智能格式化函数，数值过大或过小时使用科学计数法
+            def fmt_val(v):
+                if v == 0: return "0.00"
+                if abs(v) < 0.01 or abs(v) >= 1000:
+                    return f"{v:.1e}"
+                return f"{v:.2f}"
+                
             # 文本标签
-            c.create_text(pad_l - 4, y_top + 6, text=f"{v_max:.2f}", fill=colors[j], anchor='e', font=('Consolas', 8))
-            c.create_text(pad_l - 4, y_bot - 6, text=f"{v_min:.2f}", fill=colors[j], anchor='e', font=('Consolas', 8))
+            c.create_text(pad_l - 4, y_top + 6, text=fmt_val(v_max), fill=colors[j], anchor='e', font=('Consolas', 8))
+            c.create_text(pad_l - 4, y_bot - 6, text=fmt_val(v_min), fill=colors[j], anchor='e', font=('Consolas', 8))
             c.create_text(pad_l + 4, y_top + 8, text=labels[j], fill=colors[j], anchor='nw', font=('Microsoft YaHei', 8, 'bold'))
         
         # 游标 (当前帧竖线)
@@ -2921,13 +2976,20 @@ class App:
                 if y_top <= cy <= y_bot:
                     c.create_oval(cx-3, cy-3, cx+3, cy+3, fill=colors[j], outline='')
             
+            # 智能格式化函数，数值过大或过小时使用科学计数法
+            def fmt_val_top(v):
+                if v == 0: return "0.000"
+                if abs(v) < 0.01 or abs(v) >= 1000:
+                    return f"{v:.2e}"
+                return f"{v:.3f}"
+
             # 顶部数值显示框 (独立一行悬浮显示当前帧所有值)
             c.create_rectangle(pad_l, 0, W - pad_r + 40, pad_t - 2, fill='#2b2b2b', outline='')
-            c.create_text(pad_l, 10, text=f"总: {d['e_tot']:.3f}", fill='#f44336', anchor='w', font=('Consolas', 9))
-            c.create_text(pad_l + 75, 10, text=f"动能: {d['ek']:.3f}", fill='#2196f3', anchor='w', font=('Consolas', 9))
-            c.create_text(pad_l + 150, 10, text=f"重力: {d['ep_g']:.3f}", fill='#9e9e9e', anchor='w', font=('Consolas', 9))
-            c.create_text(pad_l + 230, 10, text=f"弹性: {d['ep_e']:.3f}", fill='#4caf50', anchor='w', font=('Consolas', 9))
-            c.create_text(W - pad_r, 10, text=f"帧: {idx}", fill='#ffeb3b', anchor='e', font=('Consolas', 9))
+            c.create_text(pad_l, 10, text=f"总:{fmt_val_top(d['e_tot'])}", fill='#f44336', anchor='w', font=('Consolas', 9))
+            c.create_text(pad_l + 80, 10, text=f"动:{fmt_val_top(d['ek'])}", fill='#2196f3', anchor='w', font=('Consolas', 9))
+            c.create_text(pad_l + 160, 10, text=f"重势:{fmt_val_top(d['ep_g'])}", fill='#9e9e9e', anchor='w', font=('Consolas', 9))
+            c.create_text(pad_l + 245, 10, text=f"弹势:{fmt_val_top(d['ep_e'])}", fill='#4caf50', anchor='w', font=('Consolas', 9))
+            c.create_text(W - pad_r, 10, text=f"帧:{idx}", fill='#ffeb3b', anchor='e', font=('Consolas', 9))
 
     # ---------------- 能量图表交互事件 ----------------
     def _get_eng_plot_idx(self, py):
