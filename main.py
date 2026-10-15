@@ -892,6 +892,15 @@ class App:
 
         self.create_part_start = None
         self._snap_target = None
+        
+        # 能量图表交互状态
+        self.eng_auto_scale = True
+        self.eng_ranges = [{'vmin': 0.0, 'vmax': 1.0} for _ in range(4)]
+        self.eng_pan_idx = -1
+        self.eng_pan_y = 0
+        self.eng_pan_vmin = 0.0
+        self.eng_pan_vmax = 1.0
+        self.eng_panning = False
 
         self.model_name = os.path.splitext(os.path.basename(__file__))[0]
         self.sim = Simulator(self)
@@ -965,10 +974,25 @@ class App:
         self.energy_frame = tk.Frame(right, bg='#2b2b2b', height=240)
         self.energy_frame.pack(side='bottom', fill='x')
         self.energy_frame.pack_propagate(False)
-        tk.Label(self.energy_frame, text='能量统计 (J)', bg='#2b2b2b', fg='#dddddd',
-                 font=('Microsoft YaHei', 9, 'bold')).pack(pady=(4, 0))
+        
+        eng_title_bar = tk.Frame(self.energy_frame, bg='#2b2b2b')
+        eng_title_bar.pack(fill='x', pady=(4, 0), padx=8)
+        tk.Label(eng_title_bar, text='能量统计 (J)', bg='#2b2b2b', fg='#dddddd',
+                 font=('Microsoft YaHei', 9, 'bold')).pack(side='left')
+        tk.Label(eng_title_bar, text='(滚轮缩放 / 拖拽平移纵轴 / 双击恢复)', bg='#2b2b2b', fg='#777777',
+                 font=('Microsoft YaHei', 8)).pack(side='right')
+
         self.energy_canvas = tk.Canvas(self.energy_frame, bg='#2b2b2b', highlightthickness=0)
         self.energy_canvas.pack(fill='both', expand=True, padx=4, pady=4)
+        
+        self.energy_canvas.bind('<Button-1>', self.on_eng_press)
+        self.energy_canvas.bind('<B1-Motion>', self.on_eng_drag)
+        self.energy_canvas.bind('<ButtonRelease-1>', self.on_eng_release)
+        self.energy_canvas.bind('<MouseWheel>', self.on_eng_wheel)
+        self.energy_canvas.bind('<Button-4>', self.on_eng_wheel)
+        self.energy_canvas.bind('<Button-5>', self.on_eng_wheel)
+        self.energy_canvas.bind('<Double-Button-1>', self.on_eng_reset)
+        self.energy_canvas.bind('<Button-3>', self.on_eng_reset)
 
         self.status = tk.Label(self.root, text='就绪', bg='#1e1e1e',
                                fg='#8bc34a', anchor='w',
@@ -2801,7 +2825,7 @@ class App:
         self._draw_energy_chart()
 
     def _draw_energy_chart(self):
-        """在右下角专门的 Canvas 中绘制能量折线图"""
+        """在右下角专门的 Canvas 中绘制能量折线图 (分为4个独立子坐标系)"""
         c = self.energy_canvas
         c.delete('all')
         if self.stage != 'simulate':
@@ -2817,67 +2841,171 @@ class App:
         
         W = c.winfo_width() or 410
         H = c.winfo_height() or 230
-        pad_l, pad_r, pad_t, pad_b = 40, 10, 30, 20
+        pad_l, pad_r, pad_t, pad_b = 45, 10, 20, 20
         
-        v_max = max(max(d['e_tot'], d['ep_g'], d['ep_e'], d['ek']) for d in cache)
-        v_min = min(min(d['e_tot'], d['ep_g'], d['ep_e'], d['ek']) for d in cache)
+        keys = ['e_tot', 'ek', 'ep_g', 'ep_e']
+        colors = ['#f44336', '#2196f3', '#9e9e9e', '#4caf50']
+        labels = ['总能量', '动能', '重力势', '弹性势']
         
-        dv = v_max - v_min
-        if dv < 1e-6: dv = 1.0
-        v_max += dv * 0.1
-        v_min -= dv * 0.1
+        num_plots = 4
+        plot_H = (H - pad_t - pad_b) / num_plots
         
-        def p2c(i, v):
-            x = pad_l + (W - pad_l - pad_r) * (i / (n - 1))
-            y = pad_t + (H - pad_t - pad_b) * (1 - (v - v_min) / (v_max - v_min))
-            return x, y
+        # 自适应计算各自的坐标范围
+        if getattr(self, 'eng_auto_scale', True):
+            for j, key in enumerate(keys):
+                v_max_g = max(d[key] for d in cache)
+                v_min_g = min(d[key] for d in cache)
+                dv = v_max_g - v_min_g
+                if dv < 1e-9: dv = 1.0
+                self.eng_ranges[j]['vmax'] = v_max_g + dv * 0.1
+                self.eng_ranges[j]['vmin'] = v_min_g - dv * 0.1
+                
+        # 逐个画出4个子坐标系
+        for j in range(num_plots):
+            y_top = pad_t + j * plot_H
+            y_bot = y_top + plot_H
             
-        pts_tot, pts_ek, pts_epg, pts_epe = [], [], [], []
-        for i, d in enumerate(cache):
-            x, y_tot = p2c(i, d['e_tot'])
-            _, y_ek = p2c(i, d['ek'])
-            _, y_epg = p2c(i, d['ep_g'])
-            _, y_epe = p2c(i, d['ep_e'])
-            pts_tot.extend([x, y_tot])
-            pts_ek.extend([x, y_ek])
-            pts_epg.extend([x, y_epg])
-            pts_epe.extend([x, y_epe])
+            v_max = self.eng_ranges[j]['vmax']
+            v_min = self.eng_ranges[j]['vmin']
+            if abs(v_max - v_min) < 1e-9:
+                v_max += 1.0; v_min -= 1.0
             
-        # 画 0 基准线
-        if v_min <= 0 <= v_max:
-            _, y0 = p2c(0, 0)
-            c.create_line(pad_l, y0, W - pad_r, y0, fill='#555555', dash=(2, 2))
-
-        # 画曲线
-        c.create_line(*pts_tot, fill='#f44336', width=2)   # 红: 总能量
-        c.create_line(*pts_ek, fill='#2196f3', width=1)    # 蓝: 动能
-        c.create_line(*pts_epg, fill='#9e9e9e', width=1)   # 灰: 重力势能
-        c.create_line(*pts_epe, fill='#4caf50', width=1)   # 绿: 弹性势能
-        
-        # 坐标轴
-        c.create_line(pad_l, pad_t, pad_l, H - pad_b, fill='#888888')
-        c.create_line(pad_l, H - pad_b, W - pad_r, H - pad_b, fill='#888888')
-        c.create_text(pad_l - 4, pad_t, text=f"{v_max:.2f}", fill='#888', anchor='e', font=('Consolas', 8))
-        c.create_text(pad_l - 4, H - pad_b, text=f"{v_min:.2f}", fill='#888', anchor='e', font=('Consolas', 8))
+            def p2c_j(i, v, ytop=y_top, ybot=y_bot, vmax=v_max, vmin=v_min):
+                x = pad_l + (W - pad_l - pad_r) * (i / (n - 1))
+                y = ytop + (ybot - ytop) * (1 - (v - vmin) / (vmax - vmin))
+                return x, y
+            
+            pts = []
+            for i, d in enumerate(cache):
+                pts.extend(p2c_j(i, d[keys[j]]))
+                
+            # 画 0 基准线
+            if v_min <= 0 <= v_max:
+                _, y0 = p2c_j(0, 0)
+                c.create_line(pad_l, y0, W - pad_r, y0, fill='#444444', dash=(2, 2))
+                
+            # 画曲线 (截断超出的部分避免溢出到其他子图区)
+            pts_clipped = []
+            for i in range(0, len(pts), 2):
+                pts_clipped.extend([pts[i], max(y_top, min(y_bot, pts[i+1]))])
+            c.create_line(*pts_clipped, fill=colors[j], width=1.5 if j>0 else 2)
+            
+            # 坐标轴和分界线
+            c.create_line(pad_l, y_top, pad_l, y_bot, fill='#888888')
+            if j == num_plots - 1:
+                c.create_line(pad_l, y_bot, W - pad_r, y_bot, fill='#888888')
+            else:
+                c.create_line(pad_l, y_bot, W - pad_r, y_bot, fill='#555555', dash=(4,4))
+                
+            # 文本标签
+            c.create_text(pad_l - 4, y_top + 6, text=f"{v_max:.2f}", fill=colors[j], anchor='e', font=('Consolas', 8))
+            c.create_text(pad_l - 4, y_bot - 6, text=f"{v_min:.2f}", fill=colors[j], anchor='e', font=('Consolas', 8))
+            c.create_text(pad_l + 4, y_top + 8, text=labels[j], fill=colors[j], anchor='nw', font=('Microsoft YaHei', 8, 'bold'))
         
         # 游标 (当前帧竖线)
         idx = self.sim.playhead
         if idx < n:
-            cx, _ = p2c(idx, 0)
+            cx = pad_l + (W - pad_l - pad_r) * (idx / (n - 1))
             c.create_line(cx, pad_t, cx, H - pad_b, fill='#ffeb3b', dash=(4, 2))
             
             d = cache[idx]
-            c.create_oval(cx-3, p2c(idx, d['e_tot'])[1]-3, cx+3, p2c(idx, d['e_tot'])[1]+3, fill='#f44336', outline='')
-            c.create_oval(cx-2, p2c(idx, d['ek'])[1]-2, cx+2, p2c(idx, d['ek'])[1]+2, fill='#2196f3', outline='')
-            c.create_oval(cx-2, p2c(idx, d['ep_g'])[1]-2, cx+2, p2c(idx, d['ep_g'])[1]+2, fill='#9e9e9e', outline='')
-            c.create_oval(cx-2, p2c(idx, d['ep_e'])[1]-2, cx+2, p2c(idx, d['ep_e'])[1]+2, fill='#4caf50', outline='')
+            # 画每个子图的交点圆圈
+            for j, key in enumerate(keys):
+                y_top = pad_t + j * plot_H
+                y_bot = y_top + plot_H
+                v_max = self.eng_ranges[j]['vmax']
+                v_min = self.eng_ranges[j]['vmin']
+                if abs(v_max - v_min) < 1e-9: v_max += 1.0; v_min -= 1.0
+                cy = y_top + (y_bot - y_top) * (1 - (d[key] - v_min) / (v_max - v_min))
+                
+                if y_top <= cy <= y_bot:
+                    c.create_oval(cx-3, cy-3, cx+3, cy+3, fill=colors[j], outline='')
             
-            # 显示文本
+            # 顶部数值显示框 (独立一行悬浮显示当前帧所有值)
+            c.create_rectangle(pad_l, 0, W - pad_r + 40, pad_t - 2, fill='#2b2b2b', outline='')
             c.create_text(pad_l, 10, text=f"总: {d['e_tot']:.3f}", fill='#f44336', anchor='w', font=('Consolas', 9))
-            c.create_text(pad_l + 80, 10, text=f"动能: {d['ek']:.3f}", fill='#2196f3', anchor='w', font=('Consolas', 9))
-            c.create_text(pad_l + 160, 10, text=f"重力势: {d['ep_g']:.3f}", fill='#9e9e9e', anchor='w', font=('Consolas', 9))
-            c.create_text(pad_l + 250, 10, text=f"弹性势: {d['ep_e']:.3f}", fill='#4caf50', anchor='w', font=('Consolas', 9))
+            c.create_text(pad_l + 75, 10, text=f"动能: {d['ek']:.3f}", fill='#2196f3', anchor='w', font=('Consolas', 9))
+            c.create_text(pad_l + 150, 10, text=f"重力: {d['ep_g']:.3f}", fill='#9e9e9e', anchor='w', font=('Consolas', 9))
+            c.create_text(pad_l + 230, 10, text=f"弹性: {d['ep_e']:.3f}", fill='#4caf50', anchor='w', font=('Consolas', 9))
             c.create_text(W - pad_r, 10, text=f"帧: {idx}", fill='#ffeb3b', anchor='e', font=('Consolas', 9))
+
+    # ---------------- 能量图表交互事件 ----------------
+    def _get_eng_plot_idx(self, py):
+        H = self.energy_canvas.winfo_height() or 230
+        pad_t, pad_b = 20, 20
+        plot_H = (H - pad_t - pad_b) / 4.0
+        if plot_H <= 0: return 0
+        idx = int((py - pad_t) / plot_H)
+        return max(0, min(3, idx))
+
+    def on_eng_press(self, e):
+        self.eng_panning = True
+        self.eng_auto_scale = False
+        self.eng_pan_idx = self._get_eng_plot_idx(e.y)
+        self.eng_pan_y = e.y
+        self.eng_pan_vmin = self.eng_ranges[self.eng_pan_idx]['vmin']
+        self.eng_pan_vmax = self.eng_ranges[self.eng_pan_idx]['vmax']
+
+    def on_eng_drag(self, e):
+        if not getattr(self, 'eng_panning', False): return
+        if getattr(self, 'eng_pan_idx', -1) < 0: return
+        
+        dy = e.y - self.eng_pan_y
+        H = self.energy_canvas.winfo_height() or 230
+        pad_t, pad_b = 20, 20
+        plot_H = (H - pad_t - pad_b) / 4.0
+        if plot_H <= 0: return
+        
+        # 画布向下拖动时，对应数值范围向上平移
+        dv_per_py = (self.eng_pan_vmax - self.eng_pan_vmin) / plot_H
+        shift_v = dy * dv_per_py
+        
+        self.eng_ranges[self.eng_pan_idx]['vmin'] = self.eng_pan_vmin + shift_v
+        self.eng_ranges[self.eng_pan_idx]['vmax'] = self.eng_pan_vmax + shift_v
+        self.redraw()
+
+    def on_eng_release(self, e):
+        self.eng_panning = False
+        self.eng_pan_idx = -1
+
+    def on_eng_wheel(self, e):
+        self.eng_auto_scale = False
+        H = self.energy_canvas.winfo_height() or 230
+        pad_t, pad_b = 20, 20
+        plot_H = (H - pad_t - pad_b) / 4.0
+        if plot_H <= 0: return
+
+        idx = self._get_eng_plot_idx(e.y)
+
+        if e.num == 4:   delta = 1
+        elif e.num == 5: delta = -1
+        else:            delta = 1 if (e.delta or 0) > 0 else -1
+        
+        factor = 0.8 if delta > 0 else 1.25
+
+        y_top = pad_t + idx * plot_H
+        py = e.y
+        if py < y_top: py = y_top
+        if py > y_top + plot_H: py = y_top + plot_H
+        
+        vmin = self.eng_ranges[idx]['vmin']
+        vmax = self.eng_ranges[idx]['vmax']
+        
+        # 根据鼠标当前所在 Y 坐标计算对应能量值，作为缩放定点中心
+        ratio = 1.0 - (py - y_top) / plot_H
+        v_mouse = vmin + ratio * (vmax - vmin)
+
+        span = vmax - vmin
+        new_span = span * factor
+        
+        self.eng_ranges[idx]['vmin'] = v_mouse - ratio * new_span
+        self.eng_ranges[idx]['vmax'] = v_mouse + (1.0 - ratio) * new_span
+        self.redraw()
+
+    def on_eng_reset(self, e):
+        """双击或右键恢复自动缩放默认范围"""
+        self.eng_auto_scale = True
+        self.redraw()
 
     def _draw_spring_limits_overlay(self):
         if self.stage not in ('assemble', 'simulate'): return
