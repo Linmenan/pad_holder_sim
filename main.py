@@ -411,6 +411,8 @@ class Simulator:
         self.snapshot_pre_sim = None
         self.frames = []
         self.force_cache = []          # 与 frames 一一对应: {part_id: {cp_id: {...}}}
+        self.energy_cache = []         # 能量缓存
+        self.initial_ep_g = 0.0        # 初始重力势能基准
         self.state = 'idle'
         self.revision = -1
         self.playhead = 0
@@ -443,6 +445,8 @@ class Simulator:
         self._gen += 1
         self.frames.clear()
         self.force_cache.clear()
+        self.energy_cache.clear()
+        self.initial_ep_g = 0.0
         self.state = 'idle'
         self.playhead = 0
         self.playing = False
@@ -464,6 +468,36 @@ class Simulator:
         # 每帧同步计算受力
         forces = self._compute_frame_forces()
         self.force_cache.append(forces)
+        # 同步计算能量
+        eng = self._compute_energies()
+        if len(self.energy_cache) == 0:
+            self.initial_ep_g = eng['ep_g']
+        eng['ep_g'] -= self.initial_ep_g  # 相对初始位形
+        eng['e_tot'] = eng['ek'] + eng['ep_g'] + eng['ep_e']
+        self.energy_cache.append(eng)
+
+    def _compute_energies(self):
+        """计算当前帧系统的各种能量 (焦耳 J)"""
+        ek = 0.0
+        ep_g = 0.0
+        ep_e = 0.0
+        for p in self.app.parts:
+            if p.locked: continue
+            v_m = np.linalg.norm(p.v) / PX_PER_M
+            ek += 0.5 * p.all_mass() * (v_m ** 2)
+            I_kgm2 = p.inertia() / (PX_PER_M ** 2)
+            ek += 0.5 * I_kgm2 * (p.omega ** 2)
+            
+            com_world = p.l2w(p.com_local())
+            ep_g += p.all_mass() * 9.81 * (-com_world[1] / PX_PER_M)
+            
+        for lk in self.app.links:
+            if lk.type == 'spring':
+                L = float(np.linalg.norm(lk.pB.world() - lk.pA.world()))
+                dx_m = (L - lk.l0) / PX_PER_M
+                ep_e += 0.5 * lk.k * (dx_m ** 2)
+                
+        return {'ek': ek, 'ep_g': ep_g, 'ep_e': ep_e}
 
     def _compute_frame_forces(self):
         """计算当前帧每个零件每个连接附的受力分解
@@ -626,6 +660,8 @@ class Simulator:
             self.restore_pre_sim()
             self.frames.clear()
             self.force_cache.clear()
+            self.energy_cache.clear()
+            self.initial_ep_g = 0.0
             self.playhead = 0
             self.stable_count = 0
             self.step_counter = 0
@@ -638,6 +674,8 @@ class Simulator:
             p.pred_angle = p.angle
         self.frames.clear()
         self.force_cache.clear()
+        self.energy_cache.clear()
+        self.initial_ep_g = 0.0
         self._append_frame()
         self.state = 'computing'
         self.playing = False
@@ -910,15 +948,27 @@ class App:
         self.canvas = tk.Canvas(body, bg='#fafaf5', highlightthickness=0)
         self.canvas.pack(side='left', fill='both', expand=True)
 
-        right = tk.Frame(body, width=300, bg='#3c3f41')
+        right = tk.Frame(body, width=420, bg='#3c3f41')  # 拓宽右侧面板
         right.pack(side='right', fill='y')
         right.pack_propagate(False)
+        
         self.props_title = tk.Label(right, text='属性 / 分析结果',
                                     bg='#3c3f41', fg='#ffffff',
                                     font=('Microsoft YaHei', 11, 'bold'))
         self.props_title.pack(pady=8)
+        
+        # 属性详情区
         self.props_inner = tk.Frame(right, bg='#3c3f41')
-        self.props_inner.pack(fill='both', expand=True, padx=6)
+        self.props_inner.pack(side='top', fill='both', expand=True, padx=6)
+
+        # 能量统计区
+        self.energy_frame = tk.Frame(right, bg='#2b2b2b', height=240)
+        self.energy_frame.pack(side='bottom', fill='x')
+        self.energy_frame.pack_propagate(False)
+        tk.Label(self.energy_frame, text='能量统计 (J)', bg='#2b2b2b', fg='#dddddd',
+                 font=('Microsoft YaHei', 9, 'bold')).pack(pady=(4, 0))
+        self.energy_canvas = tk.Canvas(self.energy_frame, bg='#2b2b2b', highlightthickness=0)
+        self.energy_canvas.pack(fill='both', expand=True, padx=4, pady=4)
 
         self.status = tk.Label(self.root, text='就绪', bg='#1e1e1e',
                                fg='#8bc34a', anchor='w',
@@ -1199,6 +1249,8 @@ class App:
         self.sim.restore_pre_sim()
         self.sim.frames.clear()
         self.sim.force_cache.clear()
+        self.sim.energy_cache.clear()
+        self.sim.initial_ep_g = 0.0
         self.sim.state = 'idle'
         self.sim.playhead = 0
         self.sim.stable_count = 0
@@ -2745,6 +2797,87 @@ class App:
         }[self.stage]
         c.create_text(10, H - 12, anchor='sw', fill='#999999',
                       font=('Microsoft YaHei', 8), text=tip)
+                      
+        self._draw_energy_chart()
+
+    def _draw_energy_chart(self):
+        """在右下角专门的 Canvas 中绘制能量折线图"""
+        c = self.energy_canvas
+        c.delete('all')
+        if self.stage != 'simulate':
+            c.create_text(200, 120, text='仅在仿真阶段显示', fill='#666666', font=('Microsoft YaHei', 10))
+            return
+        if not self.sim.energy_cache:
+            c.create_text(200, 120, text='暂无能量数据，请点击[开始仿真]', fill='#666666', font=('Microsoft YaHei', 10))
+            return
+            
+        cache = self.sim.energy_cache
+        n = len(cache)
+        if n < 2: return
+        
+        W = c.winfo_width() or 410
+        H = c.winfo_height() or 230
+        pad_l, pad_r, pad_t, pad_b = 40, 10, 30, 20
+        
+        v_max = max(max(d['e_tot'], d['ep_g'], d['ep_e'], d['ek']) for d in cache)
+        v_min = min(min(d['e_tot'], d['ep_g'], d['ep_e'], d['ek']) for d in cache)
+        
+        dv = v_max - v_min
+        if dv < 1e-6: dv = 1.0
+        v_max += dv * 0.1
+        v_min -= dv * 0.1
+        
+        def p2c(i, v):
+            x = pad_l + (W - pad_l - pad_r) * (i / (n - 1))
+            y = pad_t + (H - pad_t - pad_b) * (1 - (v - v_min) / (v_max - v_min))
+            return x, y
+            
+        pts_tot, pts_ek, pts_epg, pts_epe = [], [], [], []
+        for i, d in enumerate(cache):
+            x, y_tot = p2c(i, d['e_tot'])
+            _, y_ek = p2c(i, d['ek'])
+            _, y_epg = p2c(i, d['ep_g'])
+            _, y_epe = p2c(i, d['ep_e'])
+            pts_tot.extend([x, y_tot])
+            pts_ek.extend([x, y_ek])
+            pts_epg.extend([x, y_epg])
+            pts_epe.extend([x, y_epe])
+            
+        # 画 0 基准线
+        if v_min <= 0 <= v_max:
+            _, y0 = p2c(0, 0)
+            c.create_line(pad_l, y0, W - pad_r, y0, fill='#555555', dash=(2, 2))
+
+        # 画曲线
+        c.create_line(*pts_tot, fill='#f44336', width=2)   # 红: 总能量
+        c.create_line(*pts_ek, fill='#2196f3', width=1)    # 蓝: 动能
+        c.create_line(*pts_epg, fill='#9e9e9e', width=1)   # 灰: 重力势能
+        c.create_line(*pts_epe, fill='#4caf50', width=1)   # 绿: 弹性势能
+        
+        # 坐标轴
+        c.create_line(pad_l, pad_t, pad_l, H - pad_b, fill='#888888')
+        c.create_line(pad_l, H - pad_b, W - pad_r, H - pad_b, fill='#888888')
+        c.create_text(pad_l - 4, pad_t, text=f"{v_max:.2f}", fill='#888', anchor='e', font=('Consolas', 8))
+        c.create_text(pad_l - 4, H - pad_b, text=f"{v_min:.2f}", fill='#888', anchor='e', font=('Consolas', 8))
+        
+        # 游标 (当前帧竖线)
+        idx = self.sim.playhead
+        if idx < n:
+            cx, _ = p2c(idx, 0)
+            c.create_line(cx, pad_t, cx, H - pad_b, fill='#ffeb3b', dash=(4, 2))
+            
+            d = cache[idx]
+            c.create_oval(cx-3, p2c(idx, d['e_tot'])[1]-3, cx+3, p2c(idx, d['e_tot'])[1]+3, fill='#f44336', outline='')
+            c.create_oval(cx-2, p2c(idx, d['ek'])[1]-2, cx+2, p2c(idx, d['ek'])[1]+2, fill='#2196f3', outline='')
+            c.create_oval(cx-2, p2c(idx, d['ep_g'])[1]-2, cx+2, p2c(idx, d['ep_g'])[1]+2, fill='#9e9e9e', outline='')
+            c.create_oval(cx-2, p2c(idx, d['ep_e'])[1]-2, cx+2, p2c(idx, d['ep_e'])[1]+2, fill='#4caf50', outline='')
+            
+            # 显示文本
+            c.create_text(pad_l, 10, text=f"总: {d['e_tot']:.3f}", fill='#f44336', anchor='w', font=('Consolas', 9))
+            c.create_text(pad_l + 80, 10, text=f"动能: {d['ek']:.3f}", fill='#2196f3', anchor='w', font=('Consolas', 9))
+            c.create_text(pad_l + 160, 10, text=f"重力势: {d['ep_g']:.3f}", fill='#9e9e9e', anchor='w', font=('Consolas', 9))
+            c.create_text(pad_l + 250, 10, text=f"弹性势: {d['ep_e']:.3f}", fill='#4caf50', anchor='w', font=('Consolas', 9))
+            c.create_text(W - pad_r, 10, text=f"帧: {idx}", fill='#ffeb3b', anchor='e', font=('Consolas', 9))
 
     def _draw_spring_limits_overlay(self):
         if self.stage not in ('assemble', 'simulate'): return
@@ -4097,5 +4230,5 @@ class App:
 if __name__ == '__main__':
     root = tk.Tk()
     app = App(root)
-    root.geometry('1320x820')
+    root.geometry('1440x900') # 适当增大工具窗口尺寸
     root.mainloop()
