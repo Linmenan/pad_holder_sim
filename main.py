@@ -53,9 +53,8 @@ def setup_log_for_model(model_name):
     LOG_PATH = path
     return path
 
-# 初始: 脚本名作为默认模型名
-setup_log_for_model(os.path.splitext(os.path.basename(__file__))[0])
-logger.info(f'# 仿真日志开始: {LOG_PATH}')
+# 初始不再自动创建日志文件，调整为点击“开始仿真”后再创建
+logger.addHandler(logging.NullHandler())
 
 # ============================================================
 #   受力可视化配置 —— 全部可在此处调整
@@ -487,6 +486,7 @@ class Simulator:
         for p in self.app.parts:
             com_world = p.l2w(p.com_local())
             cp_forces = {}
+            p_torques = []
             # 重力只算本体质量 (payload 力单独作为分量作用于挂接点)
             gravity = np.array([0.0, p.body_mass * GRAVITY])
 
@@ -560,10 +560,28 @@ class Simulator:
                         continue
                     cp_static_f = cp_static_f + F
                     r = at - com_world
-                    cp_total_m += r[0]*F[1] - r[1]*F[0]
+                    m_add = r[0]*F[1] - r[1]*F[0]
+                    cp_total_m += m_add
+                    
+                    if abs(m_add) > 1e-6:
+                        p_torques.append({
+                            'label': f"附加力矩 (点#{cp.id}-{FORCE_VIZ.get(kind,{}).get('label', kind)})",
+                            'M': m_add,
+                            'kind': kind,
+                            'is_direct': False
+                        })
+
                 # 铰链力矩: 直接加总 (关于质心的力矩也是 M 本身)
                 for kind, M, at in moments:
                     cp_total_m += M
+                    if abs(M) > 1e-6:
+                        p_torques.append({
+                            'label': f"直接力矩 (点#{cp.id}-{FORCE_VIZ.get(kind,{}).get('label', kind)})",
+                            'M': M,
+                            'kind': kind,
+                            'is_direct': True
+                        })
+
                 total_force = total_force + cp_static_f
                 total_moment += cp_total_m
 
@@ -581,6 +599,7 @@ class Simulator:
                 'com_world': com_world,
                 'total_force': total_force,
                 'total_moment': total_moment,
+                'torques': p_torques,
             }
         return result
 
@@ -811,7 +830,7 @@ class App:
 
         self.sel = None
         self.assemble_sel = []
-        self.analysis_detail = 'off'   # off | simple | detailed
+        self.analysis_detail = 'detailed'   # 默认选用详细受力进行显示
 
         # 右侧属性面板: 静态结构 vs 动态数值分离
         self._props_key = None         # 当前面板对应的唯一 key (变化时才重建)
@@ -835,6 +854,7 @@ class App:
         self.create_part_start = None
         self._snap_target = None
 
+        self.model_name = os.path.splitext(os.path.basename(__file__))[0]
         self.sim = Simulator(self)
 
         self._build_ui()
@@ -1072,11 +1092,7 @@ class App:
             font=('Consolas', 9), width=12)
         self.sim_widgets['frame_label'].pack(side='left', padx=4)
 
-        # 受力分析按钮: 关 / 简略 / 详细
-        btn_analysis = mkbtn(ANALYSIS_LABELS[self.analysis_detail],
-                             self.cycle_analysis_detail, w=13,
-                             col='#455a64', fg='white')
-        self.sim_widgets['analysis'] = btn_analysis
+        # 删除了受力切换开关，默认只用详细受力显示
 
         mkbtn('适应视图', self.fit_view, w=10)
         self.refresh_sim_ui()
@@ -1149,6 +1165,13 @@ class App:
 
     def sim_start(self):
         if self.stage != 'simulate': return
+        
+        # 只在点击开始仿真时记录一次日志文件
+        global _LOG_FILE_HANDLER
+        if _LOG_FILE_HANDLER is None:
+            setup_log_for_model(self.model_name)
+            logger.info(f'# 仿真日志开始: {LOG_PATH}')
+            
         self.sim.start()
         self.refresh_sim_ui()
         self.redraw()
@@ -2589,7 +2612,7 @@ class App:
         tip = {
             'design':   '① 设计阶段: 空白拖拽创建零件 | 点击零件加连接附 | 拖动连接附/顶点',
             'assemble': '② 装配阶段: 拖动零件沿约束运动 | Ctrl+多选连接附 → 点"装配"',
-            'simulate': '③ 仿真阶段: 点击零件查看受力 | 受力按钮切换 关/简略/详细',
+            'simulate': '③ 仿真阶段: 点击零件查看受力 (点击空白处隐藏受力)',
         }[self.stage]
         c.create_text(10, H - 12, anchor='sw', fill='#999999',
                       font=('Microsoft YaHei', 8), text=tip)
@@ -2607,6 +2630,11 @@ class App:
         # ---- 各连接附: 力 + 力矩分量 ----
         for cp_id, cpd in data['cp_forces'].items():
             at = cpd['at']
+            
+            # 显示点ID，便于和右侧附加力矩对应
+            sx, sy = self.w2s(at)
+            self.canvas.create_text(sx + 14, sy - 14, text=f'点#{cp_id}', fill='#ff9800', font=('Microsoft YaHei', 9, 'bold'))
+
             if self.analysis_detail == 'simple':
                 self._draw_force_arrow(at, cpd['total_f'], 'total_f')
                 if abs(cpd.get('total_m', 0.0)) > 1e-3:
@@ -2617,14 +2645,15 @@ class App:
                 for kind, M, at_m in cpd.get('moments', []):
                     self._draw_moment_arc(at_m, M, kind)
 
-        # ---- 质心处: 重力 + 总合力矩 ----
+        # ---- 质心处: 重力 + 附加力矩组 ----
         com = data['com_world']
         if self.analysis_detail == 'detailed':
             self._draw_force_arrow(com, data['gravity'], 'gravity')
 
-        total_m = data.get('total_moment', 0.0)
-        if abs(total_m) > 1e-3:
-            self._draw_moment_arc(com, total_m, 'total_m')
+        # 绘制所有由于受力偏离质心产生的附加力矩 (直接连接力矩如铰链的，保留在原地不画在这里)
+        eccentric_torques = [t for t in data.get('torques', []) if not t.get('is_direct', False)]
+        if eccentric_torques:
+            self._draw_stacked_moments(com, eccentric_torques)
 
     def _draw_force_arrow(self, at_world, F, kind):
         cfg = FORCE_VIZ.get(kind)
@@ -2719,6 +2748,69 @@ class App:
                                 text=f'{abs(M_Nm):.3f}N·m',
                                 fill=cfg['color'],
                                 font=FORCE_LABEL_FONT)
+
+    def _draw_stacked_moments(self, at_world, torques):
+        """
+        在指定位置绘制多个力矩的堆叠圆弧。
+        torques: [{'M': float, 'kind': str}, ...]
+        半径错开，切轴向角度首尾相连。
+        """
+        if not torques: return
+        sx, sy = self.w2s(at_world)
+        
+        current_deg = 90.0  # 初始方向从正上方开始
+        base_r_world = MOMENT_MIN_WORLD_PX + 5.0
+        
+        for i, tq in enumerate(torques):
+            M_Nm = tq['M'] / (PX_PER_M * PX_PER_M)
+            if abs(M_Nm) < 1e-6: continue
+            
+            kind = tq['kind']
+            cfg = FORCE_VIZ.get(kind, FORCE_VIZ.get('other'))
+            
+            # 屏幕坐标系下 Y向下，M>0 对应顺时针。
+            # tkinter 里的 create_arc, start=0 为右侧, extent > 0 为逆时针。
+            # 所以 M>0 (顺时针) 对应 extent < 0。
+            extent_deg = - M_Nm * 120.0
+            if abs(extent_deg) < 20.0:
+                extent_deg = math.copysign(20.0, extent_deg)
+            if abs(extent_deg) > 340.0:
+                extent_deg = math.copysign(340.0, extent_deg)
+                
+            start_deg = current_deg
+            end_deg = start_deg + extent_deg
+            
+            # 半径错开
+            r_world = base_r_world + i * 6.0
+            if r_world > MOMENT_MAX_WORLD_PX * 1.5: r_world = MOMENT_MAX_WORLD_PX * 1.5
+            r = r_world * self.zoom
+            
+            self.canvas.create_arc(sx - r, sy - r, sx + r, sy + r,
+                                   start=start_deg, extent=extent_deg,
+                                   style='arc',
+                                   outline=cfg['color'],
+                                   width=cfg['width'])
+                                   
+            # 末端箭头
+            end_rad = math.radians(end_deg)
+            ex = sx + r * math.cos(end_rad)
+            ey = sy - r * math.sin(end_rad)
+            
+            # 切线方向 (依据 extent_deg 正负决定)
+            direction = 1 if extent_deg > 0 else -1
+            tangent_deg = end_deg + (90.0 * direction)
+            tangent_rad = math.radians(tangent_deg)
+            tlen = 14.0
+            tx = ex + tlen * math.cos(tangent_rad)
+            ty = ey - tlen * math.sin(tangent_rad)
+            
+            self.canvas.create_line(ex, ey, tx, ty,
+                                    fill=cfg['color'],
+                                    width=max(2, cfg['width']),
+                                    arrow='last',
+                                    arrowshape=(12, 14, 5))
+                                    
+            current_deg = end_deg
 
     def _draw_grid(self, W, H):
         c = self.canvas
@@ -3065,9 +3157,10 @@ class App:
                  bg='#3c3f41', fg='#999999').pack(anchor='w', pady=2)
         tk.Label(p, text=f'惯量 I: {o.inertia():.3e}',
                  bg='#3c3f41', fg='#999999').pack(anchor='w', pady=2)
-        tk.Label(p, text=f'连接附: {len(o.points)}  包络顶点: {len(o.hull)}',
-                 bg='#3c3f41', fg='#999999').pack(anchor='w', pady=2)
+                 
         if self.stage != 'simulate':
+            tk.Label(p, text=f'连接附: {len(o.points)}  包络顶点: {len(o.hull)}',
+                     bg='#3c3f41', fg='#999999').pack(anchor='w', pady=2)
             state_txt = '■ 已锁定 (边界条件)' if o.locked else '○ 自由'
             state_col = '#ef5350' if o.locked else '#8bc34a'
             tk.Label(p, text=state_txt, bg='#3c3f41', fg=state_col,
@@ -3077,39 +3170,40 @@ class App:
                       bg='#455a64', fg='white',
                       command=lambda: self._toggle_lock(o)
                       ).pack(fill='x', pady=2)
-        if self.stage == 'design':
-            tk.Button(p, text='重新计算包络 (基于连接附)',
-                      relief='flat', bg='#455a64', fg='white',
-                      command=lambda: (self._rebuild_envelope(o),
-                                       self._touch(),
-                                       self.update_props(), self.redraw())
-                      ).pack(fill='x', pady=2)
-        tk.Label(p, text='连接附:', bg='#3c3f41', fg='#cccccc',
-                 font=('Microsoft YaHei', 9)
-                 ).pack(anchor='w', pady=(10, 2))
-        for cp in o.points:
-            tag = ' [已连接]' if cp.link else ''
-            def _sel(c=cp):
-                # 装配阶段点已连接的连接附 -> 进入其 Link 属性面板
-                if self.stage == 'assemble' and c.link is not None:
-                    lk = self._find_link_of(c)
-                    if lk is not None:
-                        self.sel = ('link', lk)
+            if self.stage == 'design':
+                tk.Button(p, text='重新计算包络 (基于连接附)',
+                          relief='flat', bg='#455a64', fg='white',
+                          command=lambda: (self._rebuild_envelope(o),
+                                           self._touch(),
+                                           self.update_props(), self.redraw())
+                          ).pack(fill='x', pady=2)
+            tk.Label(p, text='连接附:', bg='#3c3f41', fg='#cccccc',
+                     font=('Microsoft YaHei', 9)
+                     ).pack(anchor='w', pady=(10, 2))
+            for cp in o.points:
+                tag = ' [已连接]' if cp.link else ''
+                def _sel(c=cp):
+                    # 装配阶段点已连接的连接附 -> 进入其 Link 属性面板
+                    if self.stage == 'assemble' and c.link is not None:
+                        lk = self._find_link_of(c)
+                        if lk is not None:
+                            self.sel = ('link', lk)
+                        else:
+                            self.sel = ('point', c)
                     else:
                         self.sel = ('point', c)
-                else:
-                    self.sel = ('point', c)
-                self.update_props()
-                self.redraw()
-            tk.Button(p, text=f'  #{cp.id}  [{cp.type}]{tag}',
-                      relief='flat', bg='#3c3f41', fg='#dddddd',
-                      anchor='w', command=_sel).pack(fill='x', pady=1)
+                    self.update_props()
+                    self.redraw()
+                tk.Button(p, text=f'  #{cp.id}  [{cp.type}]{tag}',
+                          relief='flat', bg='#3c3f41', fg='#dddddd',
+                          anchor='w', command=_sel).pack(fill='x', pady=1)
 
         # 仿真阶段的受力数值面板 (结构固定, 数值动态)
         if (self.stage == 'simulate'
                 and self.analysis_detail != 'off'
                 and self.sim.force_cache
                 and o.id in self.sim.force_cache[0]):
+            tk.Frame(p, height=20, bg='#3c3f41').pack(fill='x') # 多空出行展示下方受力明细
             self._props_part_forces(p, o)
 
     @staticmethod
@@ -3185,6 +3279,23 @@ class App:
         make_row('  总合力矩: ', FORCE_VIZ['total_m']['color'],
                  lambda d: f'{float(d.get("total_moment", 0.0))/(PX_PER_M*PX_PER_M):+.5f} N·m')
 
+        # 详细列举各个附加力矩与直接力矩
+        torque_details_lbl = tk.Label(p, text='', bg='#3c3f41', fg='#cccccc',
+                                      anchor='w', justify='left', font=('Consolas', 9))
+        torque_details_lbl.pack(anchor='w', padx=4, pady=(2, 6))
+        
+        def upd_torque_details(w):
+            d = get_data()
+            if d is None:
+                w.configure(text=''); return
+            lines = []
+            for tq in d.get('torques', []):
+                val_Nm = float(tq['M']) / (PX_PER_M * PX_PER_M)
+                if abs(val_Nm) >= 1e-6:
+                    lines.append(f"  ├ {tq['label']}:\n  │    {val_Nm:+.5f} N·m")
+            w.configure(text='\n'.join(lines) if lines else "  ├ 无附加力矩")
+        self._reg_dyn(torque_details_lbl, upd_torque_details)
+
         # 平衡状态提示 (动态)
         bal_lbl = tk.Label(p, text='', bg='#3c3f41', fg='#8bc34a',
                            wraplength=270, anchor='w',
@@ -3227,8 +3338,15 @@ class App:
         self._reg_dyn(gval, upd_g)
 
         # ---- 各连接附: 结构按挂接点类型固定 ----
+        type_name_map = {
+            'revolute': '转动附',
+            'spring': '弹簧',
+            'magnet': '磁吸',
+            'payload': '载荷'
+        }
         for cp in part_obj.points:
-            tk.Label(p, text=f'连接附 #{cp.id}',
+            type_str = type_name_map.get(cp.type, cp.type)
+            tk.Label(p, text=f'连接附 #{cp.id}（{type_str}）',
                      bg='#3c3f41', fg='#e69500',
                      anchor='w', font=('Microsoft YaHei', 9, 'bold')
                      ).pack(anchor='w', pady=(6, 1))
@@ -3675,21 +3793,20 @@ class App:
         self.fit_view()
         self.update_props()
         self.redraw()
-        # 用 JSON 文件主名 + 新时间戳新建日志文件
-        model_name = os.path.splitext(os.path.basename(path))[0]
-        new_log = setup_log_for_model(model_name)
-        logger.info(f'# 已从 JSON 加载模型: {path}')
-        logger.info(f'# 日志切换为: {new_log}')
-        # 打印每条 revolute 铰链的 static_damping 便于诊断
-        for lk in self.links:
-            if lk.type != 'revolute':
-                continue
-            logger.info(
-                f'  [load] link#{lk.id} revolute '
-                f'pA=cp#{lk.pA.id}@part#{lk.pA.part.id} '
-                f'pB=cp#{lk.pB.id}@part#{lk.pB.part.id} '
-                f'static_damping={lk.static_damping:.6f} N·m')
-        self.set_status(f'已加载 {path}  (日志: {new_log})')
+        
+        # 记录模型名，不再立刻创建日志，留到开始仿真时使用
+        self.model_name = os.path.splitext(os.path.basename(path))[0]
+        
+        global _LOG_FILE_HANDLER
+        if _LOG_FILE_HANDLER is not None:
+            try:
+                logger.removeHandler(_LOG_FILE_HANDLER)
+                _LOG_FILE_HANDLER.close()
+            except Exception:
+                pass
+            _LOG_FILE_HANDLER = None
+            
+        self.set_status(f'已加载 {path}')
 
 
 # ====================== 入口 ======================
