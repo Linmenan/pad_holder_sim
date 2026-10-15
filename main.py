@@ -1166,6 +1166,12 @@ class App:
             self.sim.pause_playback()
             self._update_play_button()
         self.sim.apply_frame(idx)
+        
+        # 实时刷新拖动条右侧的工具栏帧数提示文本
+        if 'frame_label' in self.sim_widgets:
+            total = max(0, len(self.sim.frames) - 1)
+            self.sim_widgets['frame_label'].configure(text=f'{idx} / {total}')
+            
         self._refresh_props_values()    # 只刷新数值, 不重建面板
         self.redraw()
 
@@ -3225,6 +3231,12 @@ class App:
         e.pack(side='left', fill='x', expand=True)
         e.bind('<Return>',   lambda ev: cmd(var.get()))
         e.bind('<FocusOut>', lambda ev: cmd(var.get()))
+        
+        # 增加对变量写入变动的实时监听（只要发生改变就尝试执行保存指令）
+        def _on_write(*args):
+            cmd(var.get())
+        var.trace_add('write', _on_write)
+        
         return var
 
     def _get_props_key(self):
@@ -3664,6 +3676,12 @@ class App:
             elif cp.type == 'payload':
                 self._field(p, '质量 kg', f'{cp.mass:.3f}',
                             lambda v: self._set_attr(cp, 'mass', v))
+        else:
+            # 在装配或仿真阶段，也对载荷类型开放质量修改
+            if cp.type == 'payload':
+                self._field(p, '载荷质量 kg', f'{cp.mass:.3f}',
+                            lambda v: self._set_attr(cp, 'mass', v))
+                
         tk.Label(p, text=f'局部坐标: ({cp.local[0]:.1f}, {cp.local[1]:.1f})',
                  bg='#3c3f41', fg='#999999').pack(anchor='w', pady=4)
         if cp.link:
@@ -3838,7 +3856,7 @@ class App:
                          insertbackground='white', relief='flat')
         entry.pack(fill='x', pady=2)
 
-        def _apply_live(_evt=None):
+        def _apply_live(*args):
             try:
                 v = float(var.get())
             except ValueError:
@@ -3847,11 +3865,16 @@ class App:
             if abs(v - lk.static_damping) < 1e-12: return
             lk.static_damping = v
             logger.info(f'[revolute] link#{lk.id} static_damping = {v:.4f} '
-                        f'(FocusOut 实时写入)')
+                        f'(实时写入)')
             self.set_status(
                 f'转动副 #{lk.id} 静态阻尼力矩 = {v:.4f} N·m (已写入)')
+            self._touch()
+            
         entry.bind('<FocusOut>', _apply_live)
         entry.bind('<Return>',   _apply_live)
+        
+        # 对单独构建的输入框添加实时变动监听
+        var.trace_add('write', _apply_live)
         tk.Label(p, text='模拟铰链处的夹紧装置: 铰链最多提供 ±M_max 的\n'
                          '力矩抵抗转动。需要更大时进入滑动摩擦。\n'
                          '(0 = 无夹紧, 铰链自由转动)',
