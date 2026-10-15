@@ -2326,8 +2326,10 @@ class App:
 
         if not pa.locked:
             pa.omega += j * invIA
+            pa.angle += j * invIA * h  # 同步修正位置层面的漂移，彻底消除夹紧力矩抗转动时的蠕变现象
         if not pb.locked:
             pb.omega -= j * invIB
+            pb.angle -= j * invIB * h
 
     def _solve_collision_position(self, pA, pB):
         """碰撞位置约束: 沿最小穿透法线分离两零件的凸包"""
@@ -2974,18 +2976,40 @@ class App:
             t = seg * (i + 1)
             pts.extend([xa + ux * t + px * off, ya + uy * t + py * off])
         pts.extend([xb, yb])
+        
         Lw = float(np.linalg.norm(lk.pB.world() - lk.pA.world()))
-        if Lw > lk.lmax: col = '#c62828'
-        elif Lw > lk.l0 * 1.02: col = '#2e7d32'
-        elif Lw < lk.l0 * 0.98: col = '#0277bd'
-        else: col = '#546e7a'
+        
+        # 智能动态颜色: 根据偏离初始长度的程度渐变到红色 (#c62828)
+        if lk.lmax < lk.l0:
+            # 压簧
+            if Lw >= lk.l0:
+                col = '#546e7a'
+            else:
+                ratio = min(1.0, (lk.l0 - Lw) / max(0.1, lk.l0 - lk.lmax))
+                r = int(0x54 + ratio * (0xc6 - 0x54))
+                g = int(0x6e + ratio * (0x28 - 0x6e))
+                b = int(0x7a + ratio * (0x28 - 0x7a))
+                col = f'#{r:02x}{g:02x}{b:02x}'
+        else:
+            # 拉簧
+            if Lw <= lk.l0:
+                col = '#546e7a'
+            else:
+                ratio = min(1.0, (Lw - lk.l0) / max(0.1, lk.lmax - lk.l0))
+                r = int(0x54 + ratio * (0xc6 - 0x54))
+                g = int(0x6e + ratio * (0x28 - 0x6e))
+                b = int(0x7a + ratio * (0x28 - 0x7a))
+                col = f'#{r:02x}{g:02x}{b:02x}'
+                
         sel = bool(self.sel and self.sel[0] == 'link' and self.sel[1] is lk)
         w = 3 if sel else 2
         c.create_line(*pts, fill=col, width=w)
+        
         if self.zoom > 0.5:
             mx, my = (xa + xb) / 2, (ya + yb) / 2
+            dl_m = (Lw - lk.l0) / PX_PER_M
             c.create_text(mx, my + 17,
-                          text=f'k={lk.k:.0f}  c={lk.c:.1f}',
+                          text=f'k={lk.k:.0f} c={lk.c:.1f} ΔL={dl_m:+.3f}m',
                           fill=col, font=('Consolas', 8))
 
     def _draw_magnet(self, lk):
@@ -3082,6 +3106,7 @@ class App:
         if self.stage == 'simulate':
             self._props_sim_status(p)
         if self.stage == 'assemble':
+            self._props_assemble_dof(p)
             tk.Label(p, text=f'已选中: {len(self.assemble_sel)} 个',
                      bg='#3c3f41', fg='#e69500',
                      font=('Microsoft YaHei', 9, 'bold')
@@ -3111,6 +3136,32 @@ class App:
         if kind == 'part':   self._props_part(p, o)
         elif kind == 'point': self._props_point(p, o)
         elif kind == 'link':  self._props_link(p, o)
+
+    def _props_assemble_dof(self, p):
+        free_parts = [pp for pp in self.parts if not pp.locked]
+        # 只有涉及到至少一个活动零件的转动副才计入有效约束
+        active_revolutes = [lk for lk in self.links if lk.type == 'revolute' and not (lk.pA.part.locked and lk.pB.part.locked)]
+        
+        N_free = len(free_parts)
+        J = len(active_revolutes)
+        # 二维平面库兹巴赫准则
+        dof = 3 * N_free - 2 * J
+        
+        # 统计设有静态阻力矩（夹紧力）的关节个数 M
+        M_active = sum(1 for lk in active_revolutes if getattr(lk, 'static_damping', 0.0) > 1e-9)
+        
+        f = tk.Frame(p, bg='#3c3f41')
+        f.pack(fill='x', pady=4)
+        tk.Label(f, text='机构自由度 (DOF): ', bg='#3c3f41', fg='#cccccc', font=('Microsoft YaHei', 9)).pack(side='left')
+        col = '#8bc34a' if dof > 0 else ('#ef5350' if dof < 0 else '#ff9800')
+        tk.Label(f, text=str(dof), bg='#3c3f41', fg=col, font=('Consolas', 10, 'bold')).pack(side='left')
+        
+        if M_active > 0:
+            tk.Label(p, text=f'带阻力矩转动附数量: {M_active}', bg='#3c3f41', fg='#4a90d9', font=('Microsoft YaHei', 9)).pack(anchor='w', pady=(4,0))
+            if M_active > max(0, dof):
+                msg = f'⚠ 超静定警告: 当前自由度剩余 {max(0, dof)}，但设置了 {M_active} 个夹紧力矩关节。这会导致未知数超出静力平衡方程组数量，阻力矩分配可能出现多解或不唯一情况，仿真受力分析将使用近似分配。'
+                tk.Label(p, text=msg, bg='#3c3f41', fg='#ef5350', wraplength=270, justify='left', font=('Microsoft YaHei', 8)).pack(anchor='w', pady=(2, 6))
+        tk.Frame(p, height=1, bg='#555555').pack(fill='x', pady=6)
 
     def _props_sim_status(self, p):
         sim = self.sim
