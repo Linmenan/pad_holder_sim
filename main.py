@@ -831,6 +831,7 @@ class App:
         self.sel = None
         self.assemble_sel = []
         self.analysis_detail = 'detailed'   # 默认选用详细受力进行显示
+        self.show_spring_limits = False     # 仿真阶段是否常驻显示弹簧限位环
 
         # 右侧属性面板: 静态结构 vs 动态数值分离
         self._props_key = None         # 当前面板对应的唯一 key (变化时才重建)
@@ -1093,6 +1094,11 @@ class App:
         self.sim_widgets['frame_label'].pack(side='left', padx=4)
 
         # 删除了受力切换开关，默认只用详细受力显示
+        
+        # 增加弹簧限位环的常驻显示/隐藏按钮
+        btn_spring_lim = mkbtn('弹簧限位: 关', self.toggle_spring_limits, w=12,
+                               col='#455a64', fg='white')
+        self.sim_widgets['spring_limits'] = btn_spring_lim
 
         mkbtn('适应视图', self.fit_view, w=10)
         self.refresh_sim_ui()
@@ -1247,6 +1253,14 @@ class App:
             self.sim_widgets['analysis'].configure(
                 text=ANALYSIS_LABELS[self.analysis_detail])
         self.update_props()
+        self.redraw()
+
+    def toggle_spring_limits(self):
+        """仿真阶段：开启/关闭弹簧限位可视化圆环常驻显示"""
+        self.show_spring_limits = not getattr(self, 'show_spring_limits', False)
+        txt = '弹簧限位: 开' if self.show_spring_limits else '弹簧限位: 关'
+        if 'spring_limits' in self.sim_widgets:
+            self.sim_widgets['spring_limits'].configure(text=txt)
         self.redraw()
 
     # ---------------- 清空 / 示例 ----------------
@@ -1691,6 +1705,23 @@ class App:
             self.delete_object(kind, obj)
 
     def _assemble_lmb(self, e, ctrl):
+        # 在拾取常规零件前，先检查是否点中了当前选中弹簧的调节圆环
+        if self.sel and self.sel[0] == 'link' and self.sel[1].type == 'spring':
+            lk = self.sel[1]
+            center_w = lk.pA.world()
+            dist = float(np.linalg.norm(self.mouse_world - center_w))
+            tol = 8.0 / self.zoom  # 屏幕上 8 像素的命中容差
+            
+            if abs(dist - lk.lmin) < tol:
+                self.dragging = ('spring_limit', lk, 'lmin')
+                return
+            elif abs(dist - lk.l0) < tol:
+                self.dragging = ('spring_limit', lk, 'l0')
+                return
+            elif abs(dist - lk.lmax) < tol:
+                self.dragging = ('spring_limit', lk, 'lmax')
+                return
+                
         kind, obj = self.pick(e.x, e.y)
         if kind == 'point':
             if ctrl:
@@ -1758,6 +1789,33 @@ class App:
             self.redraw(); return
         if self.create_part_start is not None:
             self.redraw(); return
+            
+        # 处理弹簧圆环拖拽
+        if self.stage == 'assemble' and self.dragging and self.dragging[0] == 'spring_limit':
+            lk = self.dragging[1]
+            prop = self.dragging[2]
+            center_w = lk.pA.world()
+            new_dist = float(np.linalg.norm(self.mouse_world - center_w))
+            if new_dist < 1.0: new_dist = 1.0
+            
+            setattr(lk, prop, new_dist)
+            
+            # 合法性强制联动: lmin <= l0 <= lmax
+            if prop == 'lmin':
+                if lk.l0 < lk.lmin: lk.l0 = lk.lmin
+                if lk.lmax < lk.lmin: lk.lmax = lk.lmin
+            elif prop == 'l0':
+                if lk.lmin > lk.l0: lk.lmin = lk.l0
+                if lk.lmax < lk.l0: lk.lmax = lk.l0
+            elif prop == 'lmax':
+                if lk.l0 > lk.lmax: lk.l0 = lk.lmax
+                if lk.lmin > lk.lmax: lk.lmin = lk.lmax
+                
+            self._touch()
+            self.update_props() # 实时更新侧边栏数值
+            self.redraw()
+            return
+            
         if self.stage == 'design' and self.dragging and self.drag_mouse0 is not None:
             cur_w   = self.mouse_world
             start_w = self.s2w(self.drag_mouse0[0], self.drag_mouse0[1])
@@ -1822,6 +1880,8 @@ class App:
         if (self.stage == 'assemble' and self.dragging
                 and self.dragging[0] == 'part'):
             self._correct_all_constraints()
+            self._touch()
+        if self.dragging and self.dragging[0] == 'spring_limit':
             self._touch()
         self.dragging = None
         self.drag_mouse0 = None
@@ -2681,42 +2741,73 @@ class App:
                       font=('Microsoft YaHei', 8), text=tip)
 
     def _draw_spring_limits_overlay(self):
-        if self.stage != 'assemble': return
-        # 仅当正在拖动某个零件时触发视觉辅助
-        if not (self.dragging and self.dragging[0] == 'part'): return
-        drag_part = self.dragging[1]
+        if self.stage not in ('assemble', 'simulate'): return
         
-        for lk in self.links:
-            if lk.type != 'spring': continue
-            is_A_drag = (lk.pA.part is drag_part)
-            is_B_drag = (lk.pB.part is drag_part)
-            # 确保至少有一端没被拖动（如果是连着一起拖的不画）
-            if is_A_drag and not is_B_drag:
-                center_pt = lk.pB
-            elif is_B_drag and not is_A_drag:
-                center_pt = lk.pA
-            else:
-                continue
-            
+        def _draw_circles(lk, center_pt, interactive=False):
             c_s = self.w2s(center_pt.world())
-            
             rmin = lk.lmin * self.zoom
             r0   = lk.l0 * self.zoom
             rmax = lk.lmax * self.zoom
             
+            # 如果正在拖拽某个环，高亮该环，体现交互反馈
+            active = None
+            if self.dragging and self.dragging[0] == 'spring_limit' and self.dragging[1] is lk:
+                active = self.dragging[2]
+                
+            w_min = 4 if active == 'lmin' else 2
+            w_0   = 3 if active == 'l0' else 1
+            w_max = 4 if active == 'lmax' else 2
+            
             # 压缩极限制动辅助线 (最短)
             self.canvas.create_oval(c_s[0]-rmin, c_s[1]-rmin, c_s[0]+rmin, c_s[1]+rmin, 
-                                    outline='#ef5350', dash=(4, 4), width=2)
+                                    outline='#ef5350', dash=(4, 4), width=w_min)
             # 初始长度辅助线
             self.canvas.create_oval(c_s[0]-r0, c_s[1]-r0, c_s[0]+r0, c_s[1]+r0, 
-                                    outline='#8bc34a', dash=(4, 4), width=1)
+                                    outline='#8bc34a', dash=(4, 4), width=w_0)
             # 拉伸极限制动辅助线 (最长)
             self.canvas.create_oval(c_s[0]-rmax, c_s[1]-rmax, c_s[0]+rmax, c_s[1]+rmax, 
-                                    outline='#ef5350', dash=(4, 4), width=2)
+                                    outline='#ef5350', dash=(4, 4), width=w_max)
                                     
-            self.canvas.create_text(c_s[0], c_s[1] - rmin + 8, text='限位下界', fill='#ef5350', font=('Microsoft YaHei', 8, 'bold'))
-            self.canvas.create_text(c_s[0], c_s[1] - r0 - 6, text='初始 L0', fill='#8bc34a', font=('Microsoft YaHei', 8))
-            self.canvas.create_text(c_s[0], c_s[1] - rmax - 6, text='限位上界', fill='#ef5350', font=('Microsoft YaHei', 8, 'bold'))
+            tag = ' (可拖拽)' if interactive else ''
+            self.canvas.create_text(c_s[0], c_s[1] - rmin + 12, text='限位下界'+tag, fill='#ef5350', font=('Microsoft YaHei', 8, 'bold'))
+            self.canvas.create_text(c_s[0], c_s[1] - r0 - 6, text='初始 L0'+tag, fill='#8bc34a', font=('Microsoft YaHei', 8, 'bold' if active == 'l0' else 'normal'))
+            self.canvas.create_text(c_s[0], c_s[1] - rmax - 6, text='限位上界'+tag, fill='#ef5350', font=('Microsoft YaHei', 8, 'bold'))
+
+        # 仿真阶段：检查常驻显示开关
+        if self.stage == 'simulate':
+            if getattr(self, 'show_spring_limits', False):
+                for lk in self.links:
+                    if lk.type == 'spring':
+                        # 仿真时，默认以 pA 为中心画即可
+                        _draw_circles(lk, lk.pA)
+            return
+
+        # 1. 装配阶段：拖动任意零件时，显示所有弹簧的极限圆环
+        if self.dragging and self.dragging[0] == 'part':
+            drag_part = self.dragging[1]
+            for lk in self.links:
+                if lk.type != 'spring': continue
+                is_A_drag = (lk.pA.part is drag_part)
+                is_B_drag = (lk.pB.part is drag_part)
+                # 以未拖动端为圆心；如果两端都没拖动（其他零件被拖），默认 pA
+                if is_A_drag and not is_B_drag:
+                    _draw_circles(lk, lk.pB)
+                elif is_B_drag and not is_A_drag:
+                    _draw_circles(lk, lk.pA)
+                else:
+                    _draw_circles(lk, lk.pA)
+            return
+            
+        # 2. 装配阶段：选中弹簧或正在拖拽圆环时的视觉交互
+        lk_sel = None
+        if self.sel and self.sel[0] == 'link' and self.sel[1].type == 'spring':
+            lk_sel = self.sel[1]
+        elif self.dragging and self.dragging[0] == 'spring_limit':
+            lk_sel = self.dragging[1]
+            
+        if lk_sel:
+            # 默认以 pA 作为圆心绘制交互调节环
+            _draw_circles(lk_sel, lk_sel.pA, interactive=True)
 
     # ---------------- 受力可视化 ----------------
     def _draw_part_forces(self, part):
@@ -2805,9 +2896,9 @@ class App:
         if cfg is None: return
         M_Nm = M / (PX_PER_M * PX_PER_M)   # kg·px²/s² -> N·m
         if abs(M_Nm) < 1e-6: return
-        r_world = abs(M_Nm) * MOMENT_SCALE_PX_PER_NM
-        if r_world < MOMENT_MIN_WORLD_PX:
-            r_world = MOMENT_MIN_WORLD_PX
+        
+        # 使用对数缩放基础半径，兼顾微小力矩与超大力矩的可视化
+        r_world = MOMENT_MIN_WORLD_PX + math.log10(1.0 + abs(M_Nm) * 50.0) * 15.0
         if r_world > MOMENT_MAX_WORLD_PX:
             r_world = MOMENT_MAX_WORLD_PX
         r = r_world * self.zoom
@@ -2860,7 +2951,6 @@ class App:
         sx, sy = self.w2s(at_world)
         
         current_deg = 90.0  # 初始方向从正上方开始
-        base_r_world = MOMENT_MIN_WORLD_PX + 5.0
         
         for i, tq in enumerate(torques):
             M_Nm = tq['M'] / (PX_PER_M * PX_PER_M)
@@ -2881,7 +2971,8 @@ class App:
             start_deg = current_deg
             end_deg = start_deg + extent_deg
             
-            # 半径错开
+            # 半径采用对数缩放作为基础半径，加上偏移量分层显示
+            base_r_world = MOMENT_MIN_WORLD_PX + math.log10(1.0 + abs(M_Nm) * 50.0) * 15.0
             r_world = base_r_world + i * 6.0
             if r_world > MOMENT_MAX_WORLD_PX * 1.5: r_world = MOMENT_MAX_WORLD_PX * 1.5
             r = r_world * self.zoom
